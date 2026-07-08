@@ -5,8 +5,19 @@ from typing import Any, Optional
 
 from supabase import Client, create_client
 
+def _normalize_supabase_url(url: str) -> str:
+    url = url.strip().rstrip("/")
+    for suffix in ("/rest/v1", "/auth/v1"):
+        if url.endswith(suffix):
+            url = url[: -len(suffix)]
+    return url
+
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+if SUPABASE_URL:
+    SUPABASE_URL = _normalize_supabase_url(SUPABASE_URL)
 
 
 @lru_cache(maxsize=1)
