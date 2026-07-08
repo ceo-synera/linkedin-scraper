@@ -158,6 +158,8 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.plan,
                 sender_profile,
                 language,
+                run_request.anthropic_base_url,
+                run_request.anthropic_model,
             )
 
             for lead in sdr_leads:

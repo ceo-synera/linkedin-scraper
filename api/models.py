@@ -41,3 +41,5 @@ class RunRequest(BaseModel):
     sdr_assignments: List[SdrAssignment] = Field(default_factory=list)
     apify_token: str
     anthropic_key: str
+    anthropic_base_url: Optional[str] = "https://api.anthropic.com"
+    anthropic_model: Optional[str] = "claude-sonnet-4-6"

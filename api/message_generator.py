@@ -6,7 +6,6 @@ import anthropic
 
 from api.models import SenderProfile
 
-MODEL = "claude-sonnet-4-6"
 CUSTOM1_MAX_CHARS = 300
 CUSTOM2_MAX_CHARS = 500
 
@@ -73,13 +72,18 @@ def generate_messages_for_batch(
     plan: str,
     sender_profile: Optional[SenderProfile],
     language: str,
+    anthropic_base_url: str,
+    anthropic_model: str,
 ) -> List[Dict[str, Any]]:
-    client = anthropic.Anthropic(api_key=anthropic_key)
+    client = anthropic.Anthropic(
+        api_key=anthropic_key,
+        base_url=anthropic_base_url,
+    )
 
     for lead in leads:
         prompt = _build_prompt(lead, plan, sender_profile, language)
         response = client.messages.create(
-            model=MODEL,
+            model=anthropic_model,
             max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
