@@ -26,7 +26,7 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
     combos_res = (
         supabase.table("scraper_combos_master")
         .select("*")
-        .in_("combo_code", enabled_combo_codes)
+        .in_("code", enabled_combo_codes)
         .execute()
     )
     return combos_res.data
