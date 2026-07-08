@@ -43,6 +43,6 @@ def log_run(run_id: str, level: str, message: str) -> None:
 
 def update_run_status(run_id: str, status: str, **kwargs: Any) -> None:
     supabase = get_supabase()
-    payload = {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()}
+    payload = {"status": status}
     payload.update(kwargs)
     supabase.table("runs").update(payload).eq("id", run_id).execute()
