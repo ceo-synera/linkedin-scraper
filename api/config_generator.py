@@ -14,7 +14,7 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
         supabase.table("org_combos")
         .select("combo_code")
         .eq("organization_id", organization_id)
-        .eq("enabled", True)
+        .eq("is_active", True)
         .in_("combo_code", combo_codes)
         .execute()
     )
