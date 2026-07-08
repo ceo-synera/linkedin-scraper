@@ -32,8 +32,8 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
 
     existing = (
         supabase.table("runs")
-        .select("run_id,status")
-        .eq("run_id", run_request.run_id)
+        .select("id,status")
+        .eq("id", run_request.run_id)
         .limit(1)
         .execute()
     )
@@ -61,7 +61,7 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
 async def get_run(run_id: str) -> Dict[str, Any]:
     supabase = get_supabase()
 
-    res = supabase.table("runs").select("*").eq("run_id", run_id).limit(1).execute()
+    res = supabase.table("runs").select("*").eq("id", run_id).limit(1).execute()
 
     if not res.data:
         raise HTTPException(status_code=404, detail="Run not found")

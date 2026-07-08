@@ -173,7 +173,18 @@ async def run_job(run_request: RunRequest) -> None:
         _update_run_sdr_assignments(run_id, distribution)
         _update_monthly_lead_counts(organization_id, len(new_leads))
 
-        update_run_status(run_id, "completed", total_leads_imported=len(new_leads))
+        hot_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "HOT")
+        warm_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "WARM")
+        cold_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "COLD")
+
+        update_run_status(
+            run_id,
+            "completed",
+            total_leads=len(new_leads),
+            hot_count=hot_count,
+            warm_count=warm_count,
+            cold_count=cold_count,
+        )
         log_run(run_id, "info", "Run completed")
 
     except Exception as exc:
