@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 from supabase import Client, create_client
 
+
 def _normalize_supabase_url(url: str) -> str:
     url = url.strip().rstrip("/")
     for suffix in ("/rest/v1", "/auth/v1"):
