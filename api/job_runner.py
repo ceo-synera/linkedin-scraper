@@ -153,7 +153,29 @@ async def run_job(run_request: RunRequest) -> None:
 
         # Distribute to SDRs and generate outreach messages per SDR batch.
         distribution = distribute_leads(new_leads, run_request.sdr_assignments)
-        log_run(run_id, "info", f"Distributed leads across {len(distribution)} SDRs")
+        assigned_count = sum(len(sdr_leads) for sdr_leads in distribution.values())
+        log_run(
+            run_id,
+            "info",
+            f"Distributed {assigned_count} leads across {len(distribution)} SDRs",
+        )
+
+        # Distribution matches lead.market against assignment.assigned_markets
+        # with an exact (case-sensitive) string compare. If nothing was assigned
+        # despite having leads, it's almost always a market-string mismatch —
+        # surface both sides so it's obvious in the CRM logs.
+        if new_leads and assigned_count == 0:
+            lead_markets = sorted({str(lead.get("market")) for lead in new_leads})
+            assigned_markets = sorted(
+                {m for a in run_request.sdr_assignments for m in a.assigned_markets}
+            )
+            log_run(
+                run_id,
+                "error",
+                "No leads assigned to any SDR — likely a market-string mismatch. "
+                f"lead markets={lead_markets} vs assigned_markets={assigned_markets}. "
+                "Messages will NOT be generated for unassigned leads.",
+            )
 
         assignments_by_sdr = {
             assignment.sdr_id: assignment for assignment in run_request.sdr_assignments
