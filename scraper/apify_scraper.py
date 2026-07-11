@@ -151,25 +151,30 @@ def _fetch_page(
         emit(f"[Flow 2 fetch] page {page} full actor output: {_dump(items)}")
 
         response = _first_dict(items)
-        status = response.get("status")
-        data = response.get("data") or []
+        # The actor signals readiness via `message` ("ok"), not `status`, and
+        # returns the leads under `data`. While the search is still running it
+        # returns a non-"ok" message and no `data` list.
+        message = response.get("message")
+        data = response.get("data")
+        ready = isinstance(data, list) or (
+            isinstance(message, str) and message.strip().lower() == "ok"
+        )
         emit(
-            f"[Flow 2 fetch] page {page} status={status!r} "
-            f"data items={len(data)}"
+            f"[Flow 2 fetch] page {page} message={message!r} "
+            f"data items={len(data) if isinstance(data, list) else 0}"
         )
 
-        if status == "processing":
-            emit(f"[Flow 2 fetch] page {page} processing, waiting {PROCESSING_POLL_SECONDS}s")
-            time.sleep(PROCESSING_POLL_SECONDS)
-            continue
-
-        if status == "ok":
-            leads = [_map_lead(item) for item in data if isinstance(item, dict)]
+        if ready:
+            rows = data if isinstance(data, list) else []
+            leads = [_map_lead(item) for item in rows if isinstance(item, dict)]
             emit(f"[Flow 2 fetch] page {page} ok: {len(leads)} mapped leads")
             return leads
 
-        emit(f"[Flow 2 fetch] page {page} unexpected status={status!r}; stopping")
-        return []
+        emit(
+            f"[Flow 2 fetch] page {page} not ready (message={message!r}), "
+            f"waiting {PROCESSING_POLL_SECONDS}s"
+        )
+        time.sleep(PROCESSING_POLL_SECONDS)
 
     emit(
         f"[Flow 2 fetch] page {page} still processing after "
