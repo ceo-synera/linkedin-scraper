@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
@@ -7,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.database import get_supabase
 from api.job_runner import run_job
 from api.models import RunRequest
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="LinkedIn CRM & Outreach Platform - Scraper Backend", version="1.0.0")
 

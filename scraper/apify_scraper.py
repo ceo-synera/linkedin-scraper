@@ -1,7 +1,11 @@
+import json
+import logging
 import time
 from typing import Any, Dict, List
 
 from apify_client import ApifyClient
+
+log = logging.getLogger(__name__)
 
 ACTOR_ID = "bestscrapers/sales-navigator-scraper-by-filters"
 
@@ -94,8 +98,11 @@ def _scrape_combo(
         ),
         "functions": combo.get("functions", []),
         "geo_codes": geo_codes,
+        "posted_on_linkedin": True,
         "limit": leads_for_combo,
     }
+
+    log.info(f"Actor input: {json.dumps(run_input, indent=2)}")
 
     run = client.actor(ACTOR_ID).start(run_input=run_input)
     finished_run = _wait_for_run(client, _run_field(run, "id", "id"))
