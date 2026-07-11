@@ -22,6 +22,48 @@ GEO_CODES: Dict[str, List[str]] = {
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"}
 POLL_INTERVAL_SECONDS = 5
 
+# The actor only accepts these exact company-headcount range labels.
+ALLOWED_COMPANY_HEADCOUNTS = {
+    "Self-employed",
+    "1-10",
+    "11-50",
+    "51-200",
+    "201-500",
+    "501-1000",
+    "1001-5000",
+    "5001-10000",
+    "10001+",
+}
+
+# Combos in scraper_combos_master store LinkedIn Sales Navigator headcount
+# letter codes; map them to the range labels the actor expects.
+COMPANY_HEADCOUNT_CODE_MAP = {
+    "A": "1-10",
+    "B": "11-50",
+    "C": "51-200",
+    "D": "201-500",
+    "E": "501-1000",
+    "F": "1001-5000",
+    "G": "5001-10000",
+    "H": "10001+",
+    "I": "10001+",
+}
+
+
+def _normalize_company_headcounts(values: List[Any]) -> List[str]:
+    normalized: List[str] = []
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if candidate in ALLOWED_COMPANY_HEADCOUNTS:
+            normalized.append(candidate)
+            continue
+        mapped = COMPANY_HEADCOUNT_CODE_MAP.get(candidate.upper())
+        if mapped:
+            normalized.append(mapped)
+    return normalized
+
 
 def _wait_for_run(client: ApifyClient, run_id: str) -> Dict[str, Any]:
     while True:
@@ -37,7 +79,9 @@ def _scrape_combo(
     run_input = {
         "title_keywords": combo.get("title_keywords", []),
         "seniority_levels": combo.get("seniority_levels", []),
-        "company_headcounts": combo.get("company_headcounts", []),
+        "company_headcounts": _normalize_company_headcounts(
+            combo.get("company_headcounts", [])
+        ),
         "functions": combo.get("functions", []),
         "geo_codes": geo_codes,
         "limit": leads_for_combo,
