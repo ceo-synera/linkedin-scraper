@@ -254,7 +254,7 @@ def run_scraping(
     leads_per_market = total_leads // len(markets)
 
     for market in markets:
-        geo_codes = GEO_CODES.get(market, [])
+        geo_codes = GEO_CODES.get(market.lower(), [])
         combos_for_market = combos or [{}]
         leads_per_combo = max(leads_per_market // len(combos_for_market), 1)
 
