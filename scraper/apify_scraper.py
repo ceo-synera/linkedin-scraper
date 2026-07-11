@@ -28,7 +28,6 @@ GEO_CODES: Dict[str, List[str]] = {
         "100877388",
         "104621616",
         "102927786",
-        "105646813",
     ],
     "vietnam": ["104195383"],
     "global": [],
@@ -148,8 +147,6 @@ def _fetch_page(
             f"input: {_dump(fetch_input)}"
         )
         items = _call_actor(client, fetch_input)
-        emit(f"[Flow 2 fetch] page {page} full actor output: {_dump(items)}")
-
         response = _first_dict(items)
         # The actor signals readiness via `message` ("ok"), not `status`, and
         # returns the leads under `data`. While the search is still running it
@@ -204,11 +201,9 @@ def _scrape_combo(
     emit(f"[Flow 1 init] input: {_dump(init_input)}")
 
     init_items = _call_actor(client, init_input)
-    emit(f"[Flow 1 init] full actor output: {_dump(init_items)}")
-
     init_response = _first_dict(init_items)
     request_id = init_response.get("request_id")
-    emit(f"[Flow 1 init] extracted request_id={request_id!r}")
+    emit(f"[Flow 1 init] request_id={request_id!r} message={init_response.get('message')!r}")
     if not request_id:
         emit("[Flow 1 init] no request_id returned; aborting combo")
         return []
