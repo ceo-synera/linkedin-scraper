@@ -92,13 +92,11 @@ def _scrape_combo(
 ) -> List[Dict[str, Any]]:
     run_input = {
         "title_keywords": combo.get("title_keywords", []),
-        "seniority_levels": combo.get("seniority_levels", []),
         "company_headcounts": _normalize_company_headcounts(
             combo.get("company_headcounts", [])
         ),
-        "functions": combo.get("functions", []),
         "geo_codes": geo_codes,
-        "posted_on_linkedin": True,
+        "posted_on_linkedin": "true",
         "limit": leads_for_combo,
     }
 
