@@ -14,14 +14,6 @@ PRIORITY_TITLES = [
     "engineering manager",
 ]
 
-TOP_COMPANY_SIZES = {"11-50", "51-200"}
-
-TOP_INDUSTRIES = [
-    "computer software",
-    "internet",
-    "it services",
-]
-
 AI_SIGNAL_KEYWORDS = [
     "chatgpt",
     "openai",
@@ -33,7 +25,7 @@ AI_SIGNAL_KEYWORDS = [
 
 JOB_TITLE_MAX = 30
 COMPANY_SIZE_MAX = 15
-INDUSTRY_MAX = 20
+INDUSTRY_BASE_SCORE = 10
 LINKEDIN_ACTIVITY_MAX = 15
 AI_SIGNALS_MAX = 20
 
@@ -42,7 +34,7 @@ WARM_THRESHOLD = 50
 
 
 def _score_job_title(lead: Dict[str, Any]) -> int:
-    title = (lead.get("title") or lead.get("job_title") or "").lower()
+    title = (lead.get("job_title") or lead.get("title") or "").lower()
     if not title:
         return 0
     for priority_title in PRIORITY_TITLES:
@@ -52,35 +44,26 @@ def _score_job_title(lead: Dict[str, Any]) -> int:
 
 
 def _score_company_size(lead: Dict[str, Any]) -> int:
-    size = (lead.get("company_size") or "").strip()
-    if size in TOP_COMPANY_SIZES:
-        return COMPANY_SIZE_MAX
-    return 0
+    # The Apify actor filters by company_headcounts on input, so every
+    # returned lead already matches an accepted size — it just isn't
+    # echoed back in the response.
+    return COMPANY_SIZE_MAX
 
 
 def _score_industry(lead: Dict[str, Any]) -> int:
-    industry = (lead.get("industry") or "").lower()
-    if not industry:
-        return 0
-    for top_industry in TOP_INDUSTRIES:
-        if top_industry in industry:
-            return INDUSTRY_MAX
-    return 0
+    # The actor doesn't return industry at all. Baseline score until
+    # this is enriched from another source.
+    return INDUSTRY_BASE_SCORE
 
 
 def _score_linkedin_activity(lead: Dict[str, Any]) -> int:
-    if lead.get("posted_on_linkedin"):
-        return LINKEDIN_ACTIVITY_MAX
-    return 0
+    # The actor filters by posted_on_linkedin=true on input, so every
+    # returned lead already satisfies this — it just isn't echoed back.
+    return LINKEDIN_ACTIVITY_MAX
 
 
 def _score_ai_signals(lead: Dict[str, Any]) -> int:
-    text = " ".join(
-        [
-            (lead.get("about") or lead.get("bio") or ""),
-            (lead.get("headline") or ""),
-        ]
-    ).lower()
+    text = (lead.get("about") or "").lower()
     if not text:
         return 0
     for keyword in AI_SIGNAL_KEYWORDS:
