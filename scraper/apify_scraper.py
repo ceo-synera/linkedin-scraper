@@ -35,13 +35,12 @@ def _scrape_combo(
     client: ApifyClient, combo: Dict[str, Any], geo_codes: List[str], leads_for_combo: int
 ) -> List[Dict[str, Any]]:
     run_input = {
-        "searchTitle": combo.get("name") or combo.get("code"),
-        "titleKeywords": combo.get("title_keywords", []),
-        "seniorityLevels": combo.get("seniority_levels", []),
-        "companyHeadcounts": combo.get("company_headcounts", []),
+        "title_keywords": combo.get("title_keywords", []),
+        "seniority_levels": combo.get("seniority_levels", []),
+        "company_headcounts": combo.get("company_headcounts", []),
         "functions": combo.get("functions", []),
-        "geoCodes": geo_codes,
-        "maxItems": leads_for_combo,
+        "geo_codes": geo_codes,
+        "limit": leads_for_combo,
     }
 
     run = client.actor(ACTOR_ID).start(run_input=run_input)
@@ -55,7 +54,14 @@ def _scrape_combo(
         return []
 
     items = client.dataset(dataset_id).list_items().items
-    return items
+
+    leads: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("data"), list):
+            leads.extend(item["data"])
+        else:
+            leads.append(item)
+    return leads
 
 
 def run_scraping(

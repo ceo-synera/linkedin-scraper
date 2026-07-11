@@ -77,7 +77,7 @@ def _score_linkedin_activity(lead: Dict[str, Any]) -> int:
 def _score_ai_signals(lead: Dict[str, Any]) -> int:
     text = " ".join(
         [
-            (lead.get("bio") or ""),
+            (lead.get("about") or lead.get("bio") or ""),
             (lead.get("headline") or ""),
         ]
     ).lower()
