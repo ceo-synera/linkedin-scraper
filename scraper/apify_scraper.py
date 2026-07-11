@@ -196,7 +196,7 @@ def _scrape_combo(
         "company_headcounts": _normalize_company_headcounts(
             combo.get("company_headcounts", [])
         ),
-        "geo_codes": geo_codes,
+        "geo_codes": [int(code) for code in geo_codes],
         "posted_on_linkedin": "true",
         "seniority_levels": combo.get("seniority_levels", []),
         "limit": leads_for_combo,
