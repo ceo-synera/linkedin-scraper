@@ -65,10 +65,20 @@ def _normalize_company_headcounts(values: List[Any]) -> List[str]:
     return normalized
 
 
-def _wait_for_run(client: ApifyClient, run_id: str) -> Dict[str, Any]:
+def _run_field(run: Any, dict_key: str, attr_name: str) -> Any:
+    # apify-client returns plain dicts (camelCase keys) on some versions and
+    # typed Run objects (snake_case attributes) on others; support both.
+    if run is None:
+        return None
+    if isinstance(run, dict):
+        return run.get(dict_key)
+    return getattr(run, attr_name, None)
+
+
+def _wait_for_run(client: ApifyClient, run_id: str) -> Any:
     while True:
         run = client.run(run_id).get()
-        if run and run.get("status") in TERMINAL_STATUSES:
+        if run and _run_field(run, "status", "status") in TERMINAL_STATUSES:
             return run
         time.sleep(POLL_INTERVAL_SECONDS)
 
@@ -88,12 +98,12 @@ def _scrape_combo(
     }
 
     run = client.actor(ACTOR_ID).start(run_input=run_input)
-    finished_run = _wait_for_run(client, run["id"])
+    finished_run = _wait_for_run(client, _run_field(run, "id", "id"))
 
-    if finished_run.get("status") != "SUCCEEDED":
+    if _run_field(finished_run, "status", "status") != "SUCCEEDED":
         return []
 
-    dataset_id = finished_run.get("defaultDatasetId")
+    dataset_id = _run_field(finished_run, "defaultDatasetId", "default_dataset_id")
     if not dataset_id:
         return []
 
