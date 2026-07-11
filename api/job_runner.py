@@ -92,28 +92,28 @@ def _update_monthly_lead_counts(organization_id: str, lead_count: int) -> None:
         return
 
     supabase = get_supabase()
-    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    year_month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     existing = (
         supabase.table("monthly_lead_counts")
-        .select("lead_count")
+        .select("count")
         .eq("organization_id", organization_id)
-        .eq("month", month)
+        .eq("year_month", year_month)
         .limit(1)
         .execute()
     )
 
     new_count = lead_count
     if existing.data:
-        new_count += existing.data[0]["lead_count"]
+        new_count += existing.data[0]["count"]
 
     supabase.table("monthly_lead_counts").upsert(
         {
             "organization_id": organization_id,
-            "month": month,
-            "lead_count": new_count,
+            "year_month": year_month,
+            "count": new_count,
         },
-        on_conflict="organization_id,month",
+        on_conflict="organization_id,year_month",
     ).execute()
 
 
