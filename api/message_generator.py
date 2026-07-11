@@ -9,7 +9,29 @@ from api.models import SenderProfile
 CUSTOM1_MAX_CHARS = 300
 CUSTOM2_MAX_CHARS = 500
 
+DEFAULT_LANGUAGE = "en"
+
+# Default outreach language per market, used when there's no sender profile
+# (Basic) or the profile language is the default.
+MARKET_LANGUAGE = {
+    "taiwan": "zh",
+    "latam": "es",
+    "vietnam": "vi",
+    "global": "en",
+}
+
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _resolve_language(
+    language: str, market: Optional[str], sender_profile: Optional[SenderProfile]
+) -> str:
+    # A profile with an explicitly non-default language wins. Otherwise (Basic,
+    # or a profile still on the default language) fall back to the market's
+    # language instead of always defaulting to English.
+    if sender_profile is not None and language and language != DEFAULT_LANGUAGE:
+        return language
+    return MARKET_LANGUAGE.get((market or "").lower(), DEFAULT_LANGUAGE)
 
 
 def _build_sender_context(plan: str, sender_profile: Optional[SenderProfile]) -> str:
@@ -74,6 +96,7 @@ def generate_messages_for_batch(
     language: str,
     anthropic_base_url: str,
     anthropic_model: str,
+    market: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     # The Anthropic SDK appends /v1 itself, so a base_url that already ends in
     # /v1 (e.g. https://api.aitokenking.com.tw/api/v1) would produce /v1/v1.
@@ -88,7 +111,11 @@ def generate_messages_for_batch(
     )
 
     for lead in leads:
-        prompt = _build_prompt(lead, plan, sender_profile, language)
+        # Resolve language per lead: a batch can span markets when an SDR
+        # covers several. Fall back to the batch-level market parameter.
+        lead_market = lead.get("market") or market
+        effective_language = _resolve_language(language, lead_market, sender_profile)
+        prompt = _build_prompt(lead, plan, sender_profile, effective_language)
         response = client.messages.create(
             model=anthropic_model,
             max_tokens=1024,

@@ -189,6 +189,11 @@ async def run_job(run_request: RunRequest) -> None:
             sender_profile = _resolve_sender_profile(assignment) if assignment else None
             language = sender_profile.language if sender_profile else "en"
 
+            sdr_market = (
+                assignment.assigned_markets[0]
+                if assignment and assignment.assigned_markets
+                else None
+            )
             generate_messages_for_batch(
                 sdr_leads,
                 run_request.anthropic_key,
@@ -197,6 +202,7 @@ async def run_job(run_request: RunRequest) -> None:
                 language,
                 run_request.anthropic_base_url,
                 run_request.anthropic_model,
+                market=sdr_market,
             )
 
             for lead in sdr_leads:
