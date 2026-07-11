@@ -34,7 +34,8 @@ WARM_THRESHOLD = 50
 
 
 def _score_job_title(lead: Dict[str, Any]) -> int:
-    title = (lead.get("job_title") or lead.get("title") or "").lower()
+    # `job_title` is the real field returned by the actor.
+    title = (lead.get("job_title") or "").lower()
     if not title:
         return 0
     for priority_title in PRIORITY_TITLES:
