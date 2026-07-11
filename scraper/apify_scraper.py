@@ -35,9 +35,11 @@ def _scrape_combo(
     client: ApifyClient, combo: Dict[str, Any], geo_codes: List[str], leads_for_combo: int
 ) -> List[Dict[str, Any]]:
     run_input = {
-        "searchTitle": combo.get("title_filter") or combo.get("name"),
-        "titleFilters": combo.get("title_filters", []),
-        "industryFilters": combo.get("industry_filters", []),
+        "searchTitle": combo.get("name") or combo.get("code"),
+        "titleKeywords": combo.get("title_keywords", []),
+        "seniorityLevels": combo.get("seniority_levels", []),
+        "companyHeadcounts": combo.get("company_headcounts", []),
+        "functions": combo.get("functions", []),
         "geoCodes": geo_codes,
         "maxItems": leads_for_combo,
     }
@@ -88,7 +90,7 @@ def run_scraping(
                     seen_linkedin_urls.add(linkedin_url)
 
                 lead["market"] = market
-                lead["combo"] = combo.get("name") if isinstance(combo, dict) else None
+                lead["combo"] = combo.get("code") if isinstance(combo, dict) else None
                 all_leads.append(lead)
 
     return all_leads

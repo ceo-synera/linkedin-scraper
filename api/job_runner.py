@@ -34,27 +34,62 @@ def import_leads_to_supabase(
     prospects_rows = []
 
     for lead in leads:
-        common = {
-            "organization_id": organization_id,
-            "run_id": run_id,
-            "linkedin_url": lead.get("linkedin_url") or lead.get("linkedinUrl"),
-            "full_name": lead.get("full_name") or lead.get("name"),
-            "title": lead.get("title") or lead.get("job_title"),
-            "company": lead.get("company"),
-            "market": lead.get("market"),
-            "icp_score": lead.get("icp_score"),
-            "icp_tier": lead.get("icp_tier"),
-            "custom1": lead.get("custom1"),
-            "custom2": lead.get("custom2"),
-            "created_at": now,
-        }
+        linkedin_url = lead.get("linkedin_url") or lead.get("linkedinUrl")
+        full_name = lead.get("full_name") or lead.get("name")
+        title = lead.get("title") or lead.get("job_title")
+        company = lead.get("company")
+        industry = lead.get("industry")
+        company_size = lead.get("company_size")
+        icp_score = lead.get("icp_score")
+        temperature = lead.get("icp_tier")
+        search_combo = lead.get("combo")
+        market = lead.get("market")
+        custom1 = lead.get("custom1")
+        custom2 = lead.get("custom2")
 
-        scraper_leads_rows.append(common)
+        scraper_leads_rows.append(
+            {
+                "organization_id": organization_id,
+                "run_id": run_id,
+                "linkedin_url": linkedin_url,
+                "full_name": full_name,
+                "first_name": lead.get("first_name"),
+                "last_name": lead.get("last_name"),
+                "company": company,
+                "title": title,
+                "industry": industry,
+                "company_size": company_size,
+                "location": lead.get("location"),
+                "icp_score": icp_score,
+                "temperature": temperature,
+                "search_combo": search_combo,
+                "custom1": custom1,
+                "custom2": custom2,
+                "market": market,
+                "exported_to_crm": True,
+                "created_at": now,
+            }
+        )
+
         prospects_rows.append(
             {
-                **common,
-                "assigned_to": lead.get("assigned_to"),
+                "organization_id": organization_id,
+                "name": full_name,
+                "linkedin_url": linkedin_url,
+                "company": company,
+                "title": title,
+                "industry": industry,
+                "company_size": company_size,
+                "icp_score": icp_score,
+                "lead_temperature": temperature,
+                "search_combo": search_combo,
+                "scrape_date": now,
                 "outreach_status": "new",
+                "market": market,
+                "assigned_to": lead.get("assigned_to"),
+                "custom1": custom1,
+                "custom2": custom2,
+                "created_at": now,
             }
         )
 
@@ -82,30 +117,29 @@ def _update_monthly_lead_counts(organization_id: str, lead_count: int) -> None:
         return
 
     supabase = get_supabase()
-    year_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
 
     existing = (
         supabase.table("monthly_lead_counts")
         .select("lead_count")
         .eq("organization_id", organization_id)
-        .eq("year_month", year_month)
+        .eq("month", month)
         .limit(1)
         .execute()
     )
 
+    new_count = lead_count
     if existing.data:
-        new_count = existing.data[0]["lead_count"] + lead_count
-        supabase.table("monthly_lead_counts").update({"lead_count": new_count}).eq(
-            "organization_id", organization_id
-        ).eq("year_month", year_month).execute()
-    else:
-        supabase.table("monthly_lead_counts").insert(
-            {
-                "organization_id": organization_id,
-                "year_month": year_month,
-                "lead_count": lead_count,
-            }
-        ).execute()
+        new_count += existing.data[0]["lead_count"]
+
+    supabase.table("monthly_lead_counts").upsert(
+        {
+            "organization_id": organization_id,
+            "month": month,
+            "lead_count": new_count,
+        },
+        on_conflict="organization_id,month",
+    ).execute()
 
 
 async def run_job(run_request: RunRequest) -> None:
