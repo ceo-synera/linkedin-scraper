@@ -117,7 +117,8 @@ mensajes se sacaron del pipeline).
   dato del CRM: por eso el insert a `prospects` NO se hace en el run — el CRM lo
   inserta después con su contexto de área/asignación. El run solo escribe en
   `scraper_leads` (incluyendo `custom1`/`custom2` con los mensajes generados).
-- `monthly_lead_counts`: periodo = `month`; upsert por `(organization_id, month)`.
+- `monthly_lead_counts`: periodo = `year_month` (formato `"YYYY-MM"`), contador =
+  `count`; upsert por `(organization_id, year_month)`. (No es `month`/`lead_count`.)
 
 ## Pendientes / riesgos abiertos
 
