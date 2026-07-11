@@ -112,8 +112,11 @@ mensajes se sacaron del pipeline).
 - `org_combos`: filtra por `is_active`; referencia por `combo_code`.
 - `scraper_combos_master`: la columna clave es `code`; filtros en
   `title_keywords`, `seniority_levels`, `company_headcounts`, `functions`.
-- `prospects`: `name` (NOT NULL), `lead_temperature`, `scrape_date`. No tiene
-  `run_id`.
+- `prospects`: `name` (NOT NULL), `lead_temperature`, `scrape_date` (tipo
+  `date`, no timestamp). No tiene `run_id`. **`area_id` es uuid NOT NULL** y es
+  dato del CRM: por eso el insert a `prospects` NO se hace en el run — el CRM lo
+  inserta después con su contexto de área/asignación. El run solo escribe en
+  `scraper_leads` (incluyendo `custom1`/`custom2` con los mensajes generados).
 - `monthly_lead_counts`: periodo = `month`; upsert por `(organization_id, month)`.
 
 ## Pendientes / riesgos abiertos

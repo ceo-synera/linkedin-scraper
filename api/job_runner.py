@@ -24,6 +24,12 @@ def _resolve_sender_profile(assignment) -> Optional[SenderProfile]:
 def import_leads_to_supabase(
     leads: List[Dict[str, Any]], run_id: str, organization_id: str
 ) -> None:
+    """Insert scraped leads (with generated messages) into scraper_leads.
+
+    The insert into `prospects` is intentionally NOT done here: prospects has
+    CRM-owned NOT NULL fields (area_id, ...) the scraper has no value for. That
+    step happens later in the CRM, which carries the assignment/area context.
+    """
     if not leads:
         return
 
@@ -31,29 +37,14 @@ def import_leads_to_supabase(
     now = datetime.now(timezone.utc).isoformat()
 
     scraper_leads_rows = []
-    prospects_rows = []
-
     for lead in leads:
         linkedin_url = lead.get("linkedin_url") or lead.get("linkedinUrl")
         full_name = lead.get("full_name") or lead.get("name")
         if not full_name:
             name_parts = [lead.get("first_name"), lead.get("last_name")]
             full_name = " ".join(part for part in name_parts if part) or None
-
-        # prospects.name is NOT NULL, so a nameless lead can't be imported.
         if not full_name:
             continue
-
-        title = lead.get("title") or lead.get("job_title")
-        company = lead.get("company")
-        industry = lead.get("industry")
-        company_size = lead.get("company_size")
-        icp_score = lead.get("icp_score")
-        temperature = lead.get("icp_tier")
-        search_combo = lead.get("combo")
-        market = lead.get("market")
-        custom1 = lead.get("custom1")
-        custom2 = lead.get("custom2")
 
         scraper_leads_rows.append(
             {
@@ -63,46 +54,22 @@ def import_leads_to_supabase(
                 "full_name": full_name,
                 "first_name": lead.get("first_name"),
                 "last_name": lead.get("last_name"),
-                "company": company,
-                "title": title,
-                "industry": industry,
-                "company_size": company_size,
+                "company": lead.get("company"),
+                "title": lead.get("title") or lead.get("job_title"),
                 "location": lead.get("location"),
-                "icp_score": icp_score,
-                "temperature": temperature,
-                "search_combo": search_combo,
-                "custom1": custom1,
-                "custom2": custom2,
-                "market": market,
-                "exported_to_crm": True,
+                "icp_score": lead.get("icp_score"),
+                "temperature": lead.get("icp_tier"),
+                "search_combo": lead.get("combo"),
+                "custom1": lead.get("custom1"),
+                "custom2": lead.get("custom2"),
+                "market": lead.get("market"),
+                "exported_to_crm": False,
                 "created_at": now,
             }
         )
 
-        prospects_rows.append(
-            {
-                "organization_id": organization_id,
-                "name": full_name,
-                "linkedin_url": linkedin_url,
-                "company": company,
-                "title": title,
-                "industry": industry,
-                "company_size": company_size,
-                "icp_score": icp_score,
-                "lead_temperature": temperature,
-                "search_combo": search_combo,
-                "scrape_date": now,
-                "outreach_status": "new",
-                "market": market,
-                "assigned_to": lead.get("assigned_to"),
-                "custom1": custom1,
-                "custom2": custom2,
-                "created_at": now,
-            }
-        )
-
-    supabase.table("scraper_leads").insert(scraper_leads_rows).execute()
-    supabase.table("prospects").insert(prospects_rows).execute()
+    if scraper_leads_rows:
+        supabase.table("scraper_leads").insert(scraper_leads_rows).execute()
 
 
 def _update_run_sdr_assignments(
@@ -184,6 +151,7 @@ async def run_job(run_request: RunRequest) -> None:
             f"Dedup complete: {len(new_leads)} new leads, {duplicates_count} duplicates",
         )
 
+        # Distribute to SDRs and generate outreach messages per SDR batch.
         distribution = distribute_leads(new_leads, run_request.sdr_assignments)
         log_run(run_id, "info", f"Distributed leads across {len(distribution)} SDRs")
 
@@ -218,11 +186,18 @@ async def run_job(run_request: RunRequest) -> None:
                 f"Generated messages for SDR {sdr_id} ({len(sdr_leads)} leads)",
             )
 
+        # Store leads + messages in scraper_leads. prospects is inserted later
+        # by the CRM (it owns area_id / assignment context).
         import_leads_to_supabase(new_leads, run_id, organization_id)
-        log_run(run_id, "info", f"Imported {len(new_leads)} leads into Supabase")
+        log_run(run_id, "info", f"Stored {len(new_leads)} leads in scraper_leads")
 
-        _update_run_sdr_assignments(run_id, distribution)
-        _update_monthly_lead_counts(organization_id, len(new_leads))
+        # Best-effort bookkeeping: a schema mismatch here must not fail a run
+        # whose leads + messages were already stored.
+        try:
+            _update_run_sdr_assignments(run_id, distribution)
+            _update_monthly_lead_counts(organization_id, len(new_leads))
+        except Exception as exc:
+            log_run(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
 
         hot_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "HOT")
         warm_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "WARM")
