@@ -1,11 +1,22 @@
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from apify_client import ApifyClient
 
 log = logging.getLogger(__name__)
+
+# Callback used to emit debug output. job_runner passes a callback that writes
+# to the CRM's run_logs table; without one we fall back to stdout logging.
+LogFn = Callable[[str], None]
+
+
+def _dump(value: Any) -> str:
+    try:
+        return json.dumps(value, indent=2, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
 
 ACTOR_ID = "bestscrapers/sales-navigator-scraper-by-filters"
 
@@ -87,21 +98,22 @@ def _run_field(run: Any, dict_key: str, attr_name: str) -> Any:
     return getattr(run, attr_name, None)
 
 
-def _call_actor(client: ApifyClient, run_input: Dict[str, Any]) -> Dict[str, Any]:
+def _call_actor(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
     # Both flows go through the same .call() entrypoint. .call() blocks until
-    # the run finishes and returns the Run; the actor's response object is the
-    # single item it pushes to its default dataset.
+    # the run finishes and returns the Run; the actor's response is whatever it
+    # pushes to its default dataset. Return the full item list so callers can
+    # log it verbatim for debugging.
     run = client.actor(ACTOR_ID).call(run_input=run_input)
     dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
     if not dataset_id:
-        return {}
+        return []
+    return client.dataset(dataset_id).list_items().items
 
-    items = client.dataset(dataset_id).list_items().items
-    if not items:
-        return {}
 
-    response = items[0]
-    return response if isinstance(response, dict) else {}
+def _first_dict(items: List[Any]) -> Dict[str, Any]:
+    if items and isinstance(items[0], dict):
+        return items[0]
+    return {}
 
 
 def _map_lead(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -125,41 +137,53 @@ def _map_lead(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _fetch_page(
-    client: ApifyClient, request_id: str, page: int
+    client: ApifyClient, request_id: str, page: int, emit: LogFn
 ) -> Optional[List[Dict[str, Any]]]:
     # Returns the mapped leads for the page, an empty list when the page has
     # no results, or None when the actor never stopped "processing".
     for attempt in range(MAX_PROCESSING_RETRIES):
-        response = _call_actor(client, {"request_id": request_id, "page": page})
+        fetch_input = {"request_id": request_id, "page": page}
+        emit(
+            f"[Flow 2 fetch] attempt {attempt + 1}/{MAX_PROCESSING_RETRIES} "
+            f"input: {_dump(fetch_input)}"
+        )
+        items = _call_actor(client, fetch_input)
+        emit(f"[Flow 2 fetch] page {page} full actor output: {_dump(items)}")
+
+        response = _first_dict(items)
         status = response.get("status")
+        data = response.get("data") or []
+        emit(
+            f"[Flow 2 fetch] page {page} status={status!r} "
+            f"data items={len(data)}"
+        )
 
         if status == "processing":
-            log.info(
-                f"Fetch page {page} processing "
-                f"(attempt {attempt + 1}/{MAX_PROCESSING_RETRIES}), waiting "
-                f"{PROCESSING_POLL_SECONDS}s"
-            )
+            emit(f"[Flow 2 fetch] page {page} processing, waiting {PROCESSING_POLL_SECONDS}s")
             time.sleep(PROCESSING_POLL_SECONDS)
             continue
 
         if status == "ok":
-            data = response.get("data") or []
             leads = [_map_lead(item) for item in data if isinstance(item, dict)]
-            log.info(f"Fetch page {page} ok: {len(leads)} leads")
+            emit(f"[Flow 2 fetch] page {page} ok: {len(leads)} mapped leads")
             return leads
 
-        log.warning(f"Fetch page {page} unexpected status={status!r}: {response}")
+        emit(f"[Flow 2 fetch] page {page} unexpected status={status!r}; stopping")
         return []
 
-    log.warning(
-        f"Fetch page {page} still processing after {MAX_PROCESSING_RETRIES} "
-        f"retries; giving up"
+    emit(
+        f"[Flow 2 fetch] page {page} still processing after "
+        f"{MAX_PROCESSING_RETRIES} retries; giving up"
     )
     return None
 
 
 def _scrape_combo(
-    client: ApifyClient, combo: Dict[str, Any], geo_codes: List[str], leads_for_combo: int
+    client: ApifyClient,
+    combo: Dict[str, Any],
+    geo_codes: List[str],
+    leads_for_combo: int,
+    emit: LogFn,
 ) -> List[Dict[str, Any]]:
     # Flow 1 — init search.
     init_input = {
@@ -172,16 +196,20 @@ def _scrape_combo(
         "seniority_levels": combo.get("seniority_levels", []),
         "limit": leads_for_combo,
     }
-    log.info(f"Init search input: {json.dumps(init_input, indent=2)}")
+    emit(f"[Flow 1 init] input: {_dump(init_input)}")
 
-    init_response = _call_actor(client, init_input)
+    init_items = _call_actor(client, init_input)
+    emit(f"[Flow 1 init] full actor output: {_dump(init_items)}")
+
+    init_response = _first_dict(init_items)
     request_id = init_response.get("request_id")
+    emit(f"[Flow 1 init] extracted request_id={request_id!r}")
     if not request_id:
-        log.warning(f"Init search returned no request_id: {init_response}")
+        emit("[Flow 1 init] no request_id returned; aborting combo")
         return []
-    log.info(f"Init search request_id={request_id}")
 
     # Give the search backend a moment before fetching the first page.
+    emit(f"[Flow 1 init] waiting {INIT_WAIT_SECONDS}s before first fetch")
     time.sleep(INIT_WAIT_SECONDS)
 
     # Flow 2 — fetch results, paginating until we have enough leads or the
@@ -189,7 +217,7 @@ def _scrape_combo(
     leads: List[Dict[str, Any]] = []
     page = 1
     while len(leads) < leads_for_combo:
-        page_leads = _fetch_page(client, request_id, page)
+        page_leads = _fetch_page(client, request_id, page, emit)
         if page_leads is None:
             break  # gave up waiting on "processing"
         if not page_leads:
@@ -207,7 +235,9 @@ def run_scraping(
     combos: List[Dict[str, Any]],
     markets: List[str],
     total_leads: int,
+    log_fn: Optional[LogFn] = None,
 ) -> List[Dict[str, Any]]:
+    emit: LogFn = log_fn or log.info
     client = ApifyClient(apify_token)
 
     all_leads: List[Dict[str, Any]] = []
@@ -224,7 +254,12 @@ def run_scraping(
         leads_per_combo = max(leads_per_market // len(combos_for_market), 1)
 
         for combo in combos_for_market:
-            combo_leads = _scrape_combo(client, combo, geo_codes, leads_per_combo)
+            emit(
+                f"[combo] market={market!r} code="
+                f"{combo.get('code') if isinstance(combo, dict) else None!r} "
+                f"leads_per_combo={leads_per_combo}"
+            )
+            combo_leads = _scrape_combo(client, combo, geo_codes, leads_per_combo, emit)
 
             for lead in combo_leads:
                 if not isinstance(lead, dict):

@@ -80,9 +80,14 @@ async def run_job(run_request: RunRequest) -> None:
         combos = get_combo_definitions(organization_id, run_request.combos)
         log_run(run_id, "info", f"Loaded {len(combos)} combo definitions")
 
-        # 3. scraping (Apify)
+        # 3. scraping (Apify) — route the scraper's debug output into the
+        # CRM's run_logs so it shows up in the CRM log view.
         raw_leads = run_scraping(
-            run_request.apify_token, combos, run_request.markets, run_request.total_leads
+            run_request.apify_token,
+            combos,
+            run_request.markets,
+            run_request.total_leads,
+            log_fn=lambda msg: log_run(run_id, "info", msg),
         )
         log_run(run_id, "info", f"Scraped {len(raw_leads)} raw leads")
 
