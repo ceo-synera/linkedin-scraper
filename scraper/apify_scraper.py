@@ -143,11 +143,18 @@ def run_scraping(
             combo_leads = _scrape_combo(client, combo, geo_codes, leads_per_combo)
 
             for lead in combo_leads:
+                if not isinstance(lead, dict):
+                    continue
+
+                # Real profiles always carry a linkedin_url; items without
+                # one are the actor's metadata rows (message, total_count,
+                # search_params, ...) and must not be treated as leads.
                 linkedin_url = lead.get("linkedin_url") or lead.get("linkedinUrl")
-                if linkedin_url:
-                    if linkedin_url in seen_linkedin_urls:
-                        continue
-                    seen_linkedin_urls.add(linkedin_url)
+                if not linkedin_url:
+                    continue
+                if linkedin_url in seen_linkedin_urls:
+                    continue
+                seen_linkedin_urls.add(linkedin_url)
 
                 lead["market"] = market
                 lead["combo"] = combo.get("code") if isinstance(combo, dict) else None

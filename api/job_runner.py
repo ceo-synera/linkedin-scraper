@@ -36,6 +36,14 @@ def import_leads_to_supabase(
     for lead in leads:
         linkedin_url = lead.get("linkedin_url") or lead.get("linkedinUrl")
         full_name = lead.get("full_name") or lead.get("name")
+        if not full_name:
+            name_parts = [lead.get("first_name"), lead.get("last_name")]
+            full_name = " ".join(part for part in name_parts if part) or None
+
+        # prospects.name is NOT NULL, so a nameless lead can't be imported.
+        if not full_name:
+            continue
+
         title = lead.get("title") or lead.get("job_title")
         company = lead.get("company")
         industry = lead.get("industry")
