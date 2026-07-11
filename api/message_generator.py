@@ -75,9 +75,16 @@ def generate_messages_for_batch(
     anthropic_base_url: str,
     anthropic_model: str,
 ) -> List[Dict[str, Any]]:
+    # The Anthropic SDK appends /v1 itself, so a base_url that already ends in
+    # /v1 (e.g. https://api.aitokenking.com.tw/api/v1) would produce /v1/v1.
+    # Strip a trailing /v1 before handing it to the client.
+    base_url = anthropic_base_url.rstrip("/")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+
     client = anthropic.Anthropic(
         api_key=anthropic_key,
-        base_url=anthropic_base_url,
+        base_url=base_url,
     )
 
     for lead in leads:
