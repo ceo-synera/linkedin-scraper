@@ -10,15 +10,16 @@ Backend FastAPI multi-tenant para el producto **LinkedIn CRM & Outreach Platform
 ```
 api/
   main.py              # FastAPI app y endpoints
-  models.py            # Modelos Pydantic (RunRequest, SenderProfile, SdrAssignment)
+  models.py            # Modelos Pydantic (RunRequest, BDRunRequest, SenderProfile, SdrAssignment)
   database.py          # Cliente Supabase, logging y actualización de estado de runs
-  job_runner.py        # Pipeline completo del run
-  config_generator.py  # Combos y sender profiles desde Supabase
+  job_runner.py        # Pipeline del run de leads individuales
+  bd_job_runner.py      # Pipeline del run de BD Group (búsqueda por empresa objetivo)
+  config_generator.py  # Combos, seed lists de BD Group y sender profiles desde Supabase
   message_generator.py # Generación de mensajes con Claude (o proveedor custom)
   dedup.py             # Dedup contra Supabase
-  lead_distributor.py  # Distribución de leads entre SDRs
+  lead_distributor.py  # Distribución de leads entre SDRs (solo pipeline individual)
 scraper/
-  apify_scraper.py     # Scraping vía Apify (sales-navigator-scraper-by-filters)
+  apify_scraper.py     # Scraping vía Apify (sales-navigator-scraper-by-filters): combos título/geo y BD Group por empresa
   icp_scorer.py         # Scoring ICP de leads
 requirements.txt
 Procfile
@@ -32,6 +33,7 @@ Procfile
 - **Concurrencia**: cada run usa su propio directorio temporal `/tmp/run_{run_id}/`, que se limpia al terminar (éxito o error).
 - **Multi-tenant**: `organization_id` está presente en todas las operaciones.
 - **Sin secretos persistidos**: las API keys de Apify y Claude/AITokenKing viajan en cada request desde el CRM y nunca se guardan en el servidor.
+- **BD Group es un pipeline separado**: la búsqueda por empresa objetivo (`api/bd_job_runner.py`) no es un modo del pipeline de leads individuales — tiene su propio endpoint, su propio modelo de request y no reutiliza scoring, distribución ni mensajería. Un run BD Group pertenece a un único SDR (`owner_sdr_id`), no se reparte entre varios.
 
 ## Pipeline de un run (`api/job_runner.py`)
 
@@ -60,13 +62,41 @@ Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `fai
 
 Clasificación: **HOT** ≥ 70, **WARM** 50-69, **COLD** < 50.
 
+## Pipeline de un run BD Group (`api/bd_job_runner.py`)
+
+BD Group busca por empresas objetivo (`current_company_names`) en vez de por título/geo. Es un
+pipeline completamente separado del de leads individuales: setup propio, endpoint propio, y no
+reutiliza scoring, distribución entre SDRs ni generación de mensajes (ambas son fases
+posteriores). Un run pertenece a un único SDR (`owner_sdr_id`).
+
+1. `update_run_status` → `running`
+2. `get_company_seed_lists` desde Supabase (`org_company_seed_lists`, filtradas por
+   `seed_list_ids` del request)
+3. `run_company_seed_scraping` — un run de Apify por seed list, en batches (el actor acepta
+   máx. 10 `current_company_names` y máx. 20 `title_keywords` por batch; si una seed list tiene
+   más, se parte en varios batches y se agregan los resultados)
+4. `dedup_leads` — mismo dedup contra `scraper_leads`/`prospects` que usa el pipeline individual
+5. `import_bd_candidates_to_supabase` — inserta en `scraper_leads` con `lead_type =
+   'bd_channel_contact'`, `seed_company_name` (la empresa que el actor realmente devolvió para
+   ese lead, no el input de búsqueda), `verification_status = 'pending'`, `search_combo` (nombre
+   de la seed list) y `market` (de la seed list). Sin `icp_score`, sin score de canal, sin
+   mensaje de outreach — son fases posteriores.
+6. Bookkeeping best-effort: upsert en `run_sdr_assignments` con `owner_sdr_id` y el total de
+   candidatos guardados (mismo mecanismo que usa el pipeline individual para trackear SDR↔run,
+   no una columna nueva en `scraper_leads`)
+7. `update_run_status` → `completed`, con `total_leads`
+
+Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `failed` con
+`error_message`, igual que el pipeline individual.
+
 ## Endpoints
 
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | Health check |
-| POST | `/runs` | Inicia un run (debe existir en Supabase con status `pending`) |
-| GET | `/runs/{run_id}` | Estado del run |
+| POST | `/runs` | Inicia un run de leads individuales (debe existir en Supabase con status `pending`) |
+| POST | `/bd-runs` | Inicia un run de BD Group (búsqueda por empresa objetivo; debe existir en Supabase con status `pending`) |
+| GET | `/runs/{run_id}` | Estado del run (sirve para ambos pipelines — comparten la tabla `runs`) |
 | GET | `/runs/{run_id}/logs` | Logs del run |
 | DELETE | `/runs/{run_id}` | Cancela el run si está activo |
 
@@ -82,7 +112,8 @@ El backend nunca crea tablas ni columnas — sólo lee/escribe sobre el esquema 
 | `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
 | `scraper_combos_master` | `code` (**no** `combo_code`) |
 | `sender_profiles` | `id`, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area` |
-| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `icp_tier`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`) |
+| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `icp_tier`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); para BD Group además `lead_type`, `seed_company_name`, `verification_status` |
+| `org_company_seed_lists` | `organization_id`, `list_name`, `company_names[]`, `market`, `title_keywords[]`, `seniority_levels[]` (BD Group) |
 | `monthly_lead_counts` | `organization_id`, `year_month`, `lead_count` |
 | `organizations` | no se consulta directamente — las credenciales (`anthropic_key`, `anthropic_base_url`, `anthropic_model`, `apify_token`) viajan en el request, nunca se leen desde esta tabla en el servidor |
 

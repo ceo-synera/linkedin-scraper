@@ -43,3 +43,19 @@ class RunRequest(BaseModel):
     anthropic_key: str
     anthropic_base_url: Optional[str] = "https://api.anthropic.com"
     anthropic_model: Optional[str] = "claude-sonnet-4-6"
+
+
+class BDRunRequest(BaseModel):
+    """BD Group run: search by named target companies instead of job titles.
+
+    Deliberately separate from RunRequest — a distinct pipeline with a single
+    owning SDR (no even-split/multi-SDR distribution) and no scoring/messaging
+    fields yet (those are later phases).
+    """
+
+    run_id: str
+    organization_id: str
+    seed_list_ids: List[str]
+    owner_sdr_id: str
+    total_leads: int
+    apify_token: str
