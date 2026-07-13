@@ -3,7 +3,7 @@ import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from api.config_generator import get_combo_definitions, get_sender_profile
+from api.config_generator import get_combo_definitions, get_icp_keywords, get_sender_profile
 from api.database import get_supabase, log_run, update_run_status
 from api.dedup import dedup_leads
 from api.lead_distributor import distribute_leads
@@ -58,7 +58,6 @@ def import_leads_to_supabase(
                 "title": lead.get("title") or lead.get("job_title"),
                 "location": lead.get("location"),
                 "icp_score": lead.get("icp_score"),
-                "temperature": lead.get("icp_tier"),
                 "search_combo": lead.get("combo"),
                 "custom1": lead.get("custom1"),
                 "custom2": lead.get("custom2"),
@@ -131,6 +130,9 @@ async def run_job(run_request: RunRequest) -> None:
         combos = get_combo_definitions(organization_id, run_request.combos)
         log_run(run_id, "info", f"Loaded {len(combos)} combo definitions")
 
+        icp_keywords = get_icp_keywords(organization_id)
+        log_run(run_id, "info", f"Loaded ICP keywords for {len(icp_keywords)} categories")
+
         # Route the scraper's debug output into the CRM's run_logs.
         raw_leads = run_scraping(
             run_request.apify_token,
@@ -141,7 +143,7 @@ async def run_job(run_request: RunRequest) -> None:
         )
         log_run(run_id, "info", f"Scraped {len(raw_leads)} raw leads")
 
-        scored_leads = score_leads(raw_leads)
+        scored_leads = score_leads(raw_leads, icp_keywords)
         log_run(run_id, "info", "Scored leads against ICP")
 
         new_leads, duplicates_count = dedup_leads(scored_leads, organization_id)
@@ -227,17 +229,12 @@ async def run_job(run_request: RunRequest) -> None:
         except Exception as exc:
             log_run(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
 
-        hot_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "HOT")
-        warm_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "WARM")
-        cold_count = sum(1 for lead in new_leads if lead.get("icp_tier") == "COLD")
-
+        # Hot/warm/cold is no longer derived at scrape time — that's an SDR
+        # judgment call made later, once real outreach has happened.
         update_run_status(
             run_id,
             "completed",
             total_leads=len(new_leads),
-            hot_count=hot_count,
-            warm_count=warm_count,
-            cold_count=cold_count,
         )
         log_run(run_id, "info", "Run completed")
 

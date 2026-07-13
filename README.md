@@ -46,21 +46,30 @@ Procfile
 7. Por cada SDR: `generate_messages_for_batch` (con perfil completo si el plan es Premium+)
 8. `import_leads_to_supabase` — inserta en `scraper_leads` y en `prospects` (`assigned_to`, `outreach_status='new'`)
 9. Actualiza `run_sdr_assignments` y `monthly_lead_counts`
-10. `update_run_status` → `completed`, con `total_leads`, `hot_count`, `warm_count`, `cold_count`
+10. `update_run_status` → `completed`, con `total_leads` (ya no se derivan `hot_count`/`warm_count`/`cold_count` — no hay clasificación automática)
 
 Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `failed` con `error_message`.
 
 ## Scoring ICP (`scraper/icp_scorer.py`)
 
-| Dimensión | Puntos máx. |
-|---|---|
-| Job title match (CTO, CIO, CEO, Founder, VP Engineering, Marketing Director, CDO, COO, Product Manager, Engineering Manager) | 30 |
-| Company size (11-50, 51-200) | 15 |
-| Industry (Computer Software, Internet, IT Services) | 20 |
-| Actividad en LinkedIn | 15 |
-| Señales de IA en bio/headline (ChatGPT, OpenAI, Claude, AI, LLM, Copilot) | 20 |
+Las keywords de scoring ya no están hardcodeadas: se leen por organización desde la tabla
+`org_icp_keywords` (`organization_id`, `category`, `keyword`, `weight`) vía
+`api/config_generator.get_icp_keywords`, siguiendo el mismo patrón que `get_combo_definitions`.
+Esto permite que cada organización cliente configure su propio ICP sin tocar código.
 
-Clasificación: **HOT** ≥ 70, **WARM** 50-69, **COLD** < 50.
+| Dimensión | Cómo se calcula |
+|---|---|
+| Job title | Se compara el `job_title` del lead contra las keywords de categoría `decision_title`; si hay match, se usa el peso (`weight`) más alto. Si no hay match, se repite contra `influencer_title` (tier más bajo). Sin match en ninguna categoría (o categoría sin configurar) → 0. |
+| Company size | Fijo, 15 puntos — el actor de Apify ya filtra por `company_headcounts` en el input. |
+| Industry | Se compara el bio/`about` del lead contra las keywords de categoría `industry`; se usa el mejor match (peso más alto), no una suma. Sin match o sin configurar → 0. |
+| Actividad en LinkedIn | Fijo, 15 puntos — el actor ya filtra por `posted_on_linkedin=true` en el input. |
+| Señal de compra (categoría `ai_signal` en la tabla, pero es una dimensión genérica de "señal", no específica de IA) | Se suma el peso de cada keyword distinta de esa categoría que aparezca en el bio/`about` — varios matches suman más que uno solo. Sin match o sin configurar → 0. |
+
+El total se clampea entre 0 y 100, igual que antes.
+
+No hay clasificación automática HOT/WARM/COLD: `icp_score` se calcula y se guarda igual que antes,
+pero la temperatura del lead (`temperature` en `scraper_leads`/`prospects`) ya no se autoasigna —
+queda en blanco al insertar, para que un SDR la determine más adelante en base a outreach real.
 
 ## Pipeline de un run BD Group (`api/bd_job_runner.py`)
 
@@ -112,8 +121,9 @@ El backend nunca crea tablas ni columnas — sólo lee/escribe sobre el esquema 
 | `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
 | `scraper_combos_master` | `code` (**no** `combo_code`) |
 | `sender_profiles` | `id`, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area` |
-| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `icp_tier`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); para BD Group además `lead_type`, `seed_company_name`, `verification_status` |
+| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); `temperature` ya no se autoasigna, queda en blanco al insertar; para BD Group además `lead_type`, `seed_company_name`, `verification_status` |
 | `org_company_seed_lists` | `organization_id`, `list_name`, `company_names[]`, `market`, `title_keywords[]`, `seniority_levels[]` (BD Group) |
+| `org_icp_keywords` | `organization_id`, `category` (`industry`, `ai_signal`, `decision_title`, `influencer_title`), `keyword`, `weight` |
 | `monthly_lead_counts` | `organization_id`, `year_month`, `lead_count` |
 | `organizations` | no se consulta directamente — las credenciales (`anthropic_key`, `anthropic_base_url`, `anthropic_model`, `apify_token`) viajan en el request, nunca se leen desde esta tabla en el servidor |
 
