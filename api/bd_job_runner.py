@@ -139,7 +139,7 @@ async def run_bd_job(bd_run_request: BDRunRequest) -> None:
         raise
 
 
-def _fetch_confirmed_bd_leads(
+def _fetch_bd_leads_by_id(
     run_id: str, organization_id: str, lead_ids: List[str]
 ) -> Any:
     supabase = get_supabase()
@@ -171,18 +171,23 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
             f"BD messaging requested for {len(request.lead_ids)} lead(s)",
         )
 
-        supabase, rows = _fetch_confirmed_bd_leads(run_id, organization_id, request.lead_ids)
+        supabase, rows = _fetch_bd_leads_by_id(run_id, organization_id, request.lead_ids)
 
-        # Guard against generating messages for candidates that are still
-        # 'pending' — this endpoint exists specifically so we never pay for a
-        # message before a human has confirmed the candidate is real.
-        leads = [row for row in rows if row.get("verification_status") != "pending"]
+        # Guard against generating messages for anything other than a
+        # human-confirmed candidate. verification_status's CHECK constraint
+        # (Phase 1 migration) only allows 'pending' | 'confirmed' | 'rejected'
+        # — excluding just 'pending' would let 'rejected' rows (candidates a
+        # human already discarded as noise) through too, defeating the point
+        # of the verification step. Only 'confirmed' should ever get a paid
+        # message generated for it.
+        leads = [row for row in rows if row.get("verification_status") == "confirmed"]
         skipped = len(rows) - len(leads)
         if skipped:
             log_run(
                 run_id,
                 "info",
-                f"Skipped {skipped} lead(s) still verification_status='pending'",
+                f"Skipped {skipped} lead(s) not verification_status='confirmed' "
+                "(still pending or already rejected)",
             )
 
         if not leads:
