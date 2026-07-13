@@ -3,7 +3,12 @@ import shutil
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from api.config_generator import get_combo_definitions, get_icp_keywords, get_sender_profile
+from api.config_generator import (
+    get_combo_definitions,
+    get_icp_keywords,
+    get_organization_product_description,
+    get_sender_profile,
+)
 from api.database import get_supabase, log_run, update_run_status
 from api.dedup import dedup_leads
 from api.lead_distributor import distribute_leads
@@ -133,6 +138,8 @@ async def run_job(run_request: RunRequest) -> None:
         icp_keywords = get_icp_keywords(organization_id)
         log_run(run_id, "info", f"Loaded ICP keywords for {len(icp_keywords)} categories")
 
+        product_description = get_organization_product_description(organization_id)
+
         # Route the scraper's debug output into the CRM's run_logs.
         raw_leads = run_scraping(
             run_request.apify_token,
@@ -205,6 +212,7 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.anthropic_base_url,
                 run_request.anthropic_model,
                 market=sdr_market,
+                product_description=product_description,
             )
 
             for lead in sdr_leads:

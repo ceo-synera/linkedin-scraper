@@ -10,12 +10,12 @@ Backend FastAPI multi-tenant para el producto **LinkedIn CRM & Outreach Platform
 ```
 api/
   main.py              # FastAPI app y endpoints
-  models.py            # Modelos Pydantic (RunRequest, BDRunRequest, SenderProfile, SdrAssignment)
+  models.py            # Modelos Pydantic (RunRequest, BDRunRequest, BDMessageRequest, SenderProfile, SdrAssignment)
   database.py          # Cliente Supabase, logging y actualización de estado de runs
   job_runner.py        # Pipeline del run de leads individuales
-  bd_job_runner.py      # Pipeline del run de BD Group (búsqueda por empresa objetivo)
-  config_generator.py  # Combos, seed lists de BD Group y sender profiles desde Supabase
-  message_generator.py # Generación de mensajes con Claude (o proveedor custom)
+  bd_job_runner.py      # Pipeline del run de BD Group (scraping + mensajería bajo demanda)
+  config_generator.py  # Combos, seed lists de BD Group, ICP keywords, channel hooks, product_description y sender profiles desde Supabase
+  message_generator.py # Generación de mensajes con Claude (o proveedor custom): modo individual y modo BD Group
   dedup.py             # Dedup contra Supabase
   lead_distributor.py  # Distribución de leads entre SDRs (solo pipeline individual)
 scraper/
@@ -98,6 +98,19 @@ posteriores). Un run pertenece a un único SDR (`owner_sdr_id`).
 Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `failed` con
 `error_message`, igual que el pipeline individual.
 
+**Mensajería BD Group no se genera durante el scraping.** Los candidatos quedan sin `custom1`/
+`custom2` hasta que un humano confirma que el candidato es real (`verification_status` deja de
+ser `'pending'`) — generar un mensaje pagado con Claude para cada candidato crudo, antes de que
+nadie lo confirme, desperdiciaría llamadas en contactos que terminan descartados como ruido. La
+mensajería se dispara por separado vía `POST /bd-runs/{run_id}/messages` (ver Endpoints), que:
+
+1. Busca en `scraper_leads` las filas de `lead_ids` para ese `run_id`/`organization_id`
+2. Descarta cualquiera que siga en `verification_status = 'pending'` (guardia de seguridad —
+   nunca se genera mensaje para un candidato no confirmado, sin importar qué envíe el caller)
+3. `get_organization_product_description` y `get_channel_hooks` desde Supabase
+4. `generate_bd_messages_for_batch` — modo BD Group (ver sección de Mensajería más abajo)
+5. Escribe `custom1`/`custom2` de vuelta en cada fila de `scraper_leads`
+
 ## Endpoints
 
 | Método | Ruta | Descripción |
@@ -105,6 +118,7 @@ Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `fai
 | GET | `/health` | Health check |
 | POST | `/runs` | Inicia un run de leads individuales (debe existir en Supabase con status `pending`) |
 | POST | `/bd-runs` | Inicia un run de BD Group (búsqueda por empresa objetivo; debe existir en Supabase con status `pending`) |
+| POST | `/bd-runs/{run_id}/messages` | Genera mensajes solo para candidatos BD Group ya confirmados por un humano (no se llama automáticamente durante el scraping) |
 | GET | `/runs/{run_id}` | Estado del run (sirve para ambos pipelines — comparten la tabla `runs`) |
 | GET | `/runs/{run_id}/logs` | Logs del run |
 | DELETE | `/runs/{run_id}` | Cancela el run si está activo |
@@ -120,12 +134,19 @@ El backend nunca crea tablas ni columnas — sólo lee/escribe sobre el esquema 
 | `run_sdr_assignments` | `run_id`, `sdr_id`, `sender_profile_id`, `assigned_markets`, `leads_assigned` |
 | `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
 | `scraper_combos_master` | `code` (**no** `combo_code`) |
-| `sender_profiles` | `id`, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area` |
-| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); `temperature` ya no se autoasigna, queda en blanco al insertar; para BD Group además `lead_type`, `seed_company_name`, `verification_status` |
+| `sender_profiles` | `id`, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area`, `connection_note_max_chars`, `followup_max_chars` |
+| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); `temperature` ya no se autoasigna, queda en blanco al insertar; para BD Group además `lead_type`, `seed_company_name`, `verification_status`, y `channel_family` (asumido — usado para elegir el `hook_copy` de `org_channel_hooks`, ver nota abajo) |
 | `org_company_seed_lists` | `organization_id`, `list_name`, `company_names[]`, `market`, `title_keywords[]`, `seniority_levels[]` (BD Group) |
 | `org_icp_keywords` | `organization_id`, `category` (`industry`, `ai_signal`, `decision_title`, `influencer_title`), `keyword`, `weight` |
+| `org_channel_hooks` | `organization_id`, `channel_family`, `hook_copy` (ángulo propio de la org para mensajería BD Group) |
 | `monthly_lead_counts` | `organization_id`, `year_month`, `lead_count` |
-| `organizations` | no se consulta directamente — las credenciales (`anthropic_key`, `anthropic_base_url`, `anthropic_model`, `apify_token`) viajan en el request, nunca se leen desde esta tabla en el servidor |
+| `organizations` | `id`, `product_description` (descripción del producto de la org, usada para dar contexto real en los mensajes; las credenciales `anthropic_key`, `anthropic_base_url`, `anthropic_model`, `apify_token` siguen viajando en el request, nunca se leen desde esta tabla) |
+
+> ⚠️ `channel_family` en `scraper_leads` no fue verificado contra el esquema real de Supabase —
+> se asume que la CRM lo setea al confirmar un candidato BD Group (junto con `verification_status`).
+> Si el nombre real de la columna es otro, `lead.get("channel_family")` en
+> `api/message_generator.py` simplemente no encuentra el hook y degrada a un pitch genérico sin
+> error — pero conviene confirmar el nombre real antes de depender de esto en producción.
 
 > ⚠️ Antes de tocar cualquier query nueva contra Supabase, verificar el nombre exacto de la columna contra esta tabla. Varios de los bugs en producción (ver changelog) fueron justamente nombres de columna que no coincidían con el esquema real.
 
@@ -139,11 +160,24 @@ El backend nunca crea tablas ni columnas — sólo lee/escribe sobre el esquema 
 
 El cliente se inicializa como `anthropic.Anthropic(api_key=anthropic_key, base_url=anthropic_base_url)` y cada llamada a `messages.create` usa `model=anthropic_model`.
 
-Reglas de contenido:
+Reglas de contenido (ambos modos, individual y BD Group):
 - **Basic**: mensajes genéricos, sin nombre ni firma del sender.
 - **Premium+**: perfil completo del SDR (`years_experience`, `seniority`, `expertise_area`) para dar contexto real.
-- `custom1` (connection request): máx. 300 caracteres.
-- `custom2` (follow-up): máx. 500 caracteres.
+- `custom1` (connection request) / `custom2` (follow-up): el límite de caracteres ya no está hardcodeado — viene de `sender_profiles.connection_note_max_chars` / `followup_max_chars`. Si el sender profile no los tiene seteados, se usa el default histórico (300 / 500).
+- `get_organization_product_description` se resuelve una vez por run y se inyecta en el prompt de cada mensaje (individual y BD) para que la mensajería describa algo concreto de lo que vende la org. Si la org no lo llenó todavía, esa parte del prompt simplemente se omite — sin error, sin placeholder inventado.
+
+**Modo BD Group** (`generate_bd_messages_for_batch`), distinto del modo individual:
+- Encuadre en tercera persona ("your customers have this problem") en vez de segunda persona — es
+  una propuesta de partnership, no una venta directa.
+- Usa el `hook_copy` propio de la org para el `channel_family` de ese contacto (desde
+  `org_channel_hooks`) como ángulo central, en vez de un pitch genérico. Sin hook configurado para
+  ese `channel_family` → pitch genérico, sin error.
+- Respeta el mismo límite real del sender (por `sender_profiles`) como techo duro, pero el prompt
+  pide explícitamente usar una porción notablemente mayor de ese espacio que un mensaje individual
+  típico — sin un largo objetivo hardcodeado, solo la instrucción de aprovechar el espacio
+  disponible.
+- Solo se genera bajo demanda vía `POST /bd-runs/{run_id}/messages`, nunca automáticamente durante
+  el scraping (ver sección de pipeline BD Group).
 
 ## Variables de entorno
 

@@ -5,10 +5,10 @@ from typing import Any, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.bd_job_runner import run_bd_job
+from api.bd_job_runner import run_bd_job, run_bd_messages_job
 from api.database import get_supabase
 from api.job_runner import run_job
-from api.models import BDRunRequest, RunRequest
+from api.models import BDMessageRequest, BDRunRequest, RunRequest
 
 logging.basicConfig(level=logging.INFO)
 
@@ -90,6 +90,31 @@ async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
     active_tasks[bd_run_request.run_id] = task
 
     return {"run_id": bd_run_request.run_id, "status": "started"}
+
+
+@app.post("/bd-runs/{run_id}/messages")
+async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) -> Dict[str, str]:
+    supabase = get_supabase()
+
+    existing = (
+        supabase.table("runs")
+        .select("id,status")
+        .eq("id", run_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    def _on_done(task: asyncio.Task, run_id: str = run_id) -> None:
+        active_tasks.pop(run_id, None)
+
+    task = asyncio.create_task(run_bd_messages_job(run_id, message_request))
+    task.add_done_callback(_on_done)
+    active_tasks[run_id] = task
+
+    return {"run_id": run_id, "status": "started"}
 
 
 @app.get("/runs/{run_id}")

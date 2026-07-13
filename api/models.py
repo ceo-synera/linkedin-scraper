@@ -22,6 +22,8 @@ class SenderProfile(BaseModel):
     years_experience: Optional[int] = None
     seniority: Optional[str] = None
     expertise_area: Optional[str] = None
+    connection_note_max_chars: Optional[int] = None
+    followup_max_chars: Optional[int] = None
 
 
 class SdrAssignment(BaseModel):
@@ -59,3 +61,20 @@ class BDRunRequest(BaseModel):
     owner_sdr_id: str
     total_leads: int
     apify_token: str
+
+
+class BDMessageRequest(BaseModel):
+    """Generate outreach messages for a set of already human-confirmed BD Group
+    candidates. Deliberately separate from run creation — messages are only
+    ever generated on demand for confirmed rows, never automatically for every
+    raw scraped candidate.
+    """
+
+    organization_id: str
+    lead_ids: List[str]
+    plan: Plan
+    sender_profile_id: Optional[str] = None
+    sender_profile: Optional[SenderProfile] = None
+    anthropic_key: str
+    anthropic_base_url: Optional[str] = "https://api.anthropic.com"
+    anthropic_model: Optional[str] = "claude-sonnet-4-6"
