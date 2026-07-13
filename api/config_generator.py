@@ -1,10 +1,16 @@
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from api.database import get_supabase
 from api.models import SenderProfile
 from scraper.apify_scraper import GEO_CODES
 
-__all__ = ["GEO_CODES", "get_combo_definitions", "get_sender_profile"]
+__all__ = [
+    "GEO_CODES",
+    "get_combo_definitions",
+    "get_icp_keywords",
+    "get_sender_profile",
+]
 
 
 def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[Dict[str, Any]]:
@@ -30,6 +36,28 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
         .execute()
     )
     return combos_res.data
+
+
+def get_icp_keywords(organization_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch the org's ICP scoring keywords, grouped by category.
+
+    Categories: industry, ai_signal, decision_title, influencer_title. A
+    category missing from the config (or the whole table empty for this org)
+    simply yields an empty list — callers must score that as 0, not error.
+    """
+    supabase = get_supabase()
+
+    keywords_res = (
+        supabase.table("org_icp_keywords")
+        .select("category, keyword, weight")
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in keywords_res.data:
+        grouped[row["category"]].append({"keyword": row["keyword"], "weight": row["weight"]})
+    return dict(grouped)
 
 
 def get_sender_profile(profile_id: str) -> Optional[SenderProfile]:
