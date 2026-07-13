@@ -35,7 +35,10 @@ def _update_run_sdr_assignment(run_id: str, owner_sdr_id: str, leads_assigned: i
 
 
 def import_bd_candidates_to_supabase(
-    leads: List[Dict[str, Any]], run_id: str, organization_id: str
+    leads: List[Dict[str, Any]],
+    run_id: str,
+    organization_id: str,
+    channel_family_by_seed_list_id: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Insert BD Group candidates into scraper_leads as tagged, unscored rows.
 
@@ -47,6 +50,7 @@ def import_bd_candidates_to_supabase(
 
     supabase = get_supabase()
     now = datetime.now(timezone.utc).isoformat()
+    channel_family_by_seed_list_id = channel_family_by_seed_list_id or {}
 
     rows = []
     for lead in leads:
@@ -74,6 +78,7 @@ def import_bd_candidates_to_supabase(
                 "lead_type": "bd_channel_contact",
                 "seed_company_name": lead.get("company"),
                 "verification_status": "pending",
+                "channel_family": channel_family_by_seed_list_id.get(lead.get("seed_list_id")),
                 "exported_to_crm": False,
                 "created_at": now,
             }
@@ -94,6 +99,10 @@ async def run_bd_job(bd_run_request: BDRunRequest) -> None:
         seed_lists = get_company_seed_lists(organization_id, bd_run_request.seed_list_ids)
         log_run(run_id, "info", f"Loaded {len(seed_lists)} company seed lists")
 
+        channel_family_by_seed_list_id = {
+            seed_list["id"]: seed_list.get("channel_family") for seed_list in seed_lists
+        }
+
         raw_leads = run_company_seed_scraping(
             bd_run_request.apify_token,
             seed_lists,
@@ -109,7 +118,9 @@ async def run_bd_job(bd_run_request: BDRunRequest) -> None:
             f"Dedup complete: {len(new_leads)} new candidates, {duplicates_count} duplicates",
         )
 
-        import_bd_candidates_to_supabase(new_leads, run_id, organization_id)
+        import_bd_candidates_to_supabase(
+            new_leads, run_id, organization_id, channel_family_by_seed_list_id
+        )
         log_run(run_id, "info", f"Stored {len(new_leads)} BD candidates in scraper_leads")
 
         # Best-effort bookkeeping: a schema mismatch here must not fail a run
