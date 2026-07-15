@@ -1,10 +1,19 @@
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from api.database import get_supabase
 from api.models import SenderProfile
 from scraper.apify_scraper import GEO_CODES
 
-__all__ = ["GEO_CODES", "get_combo_definitions", "get_sender_profile"]
+__all__ = [
+    "GEO_CODES",
+    "get_channel_hooks",
+    "get_combo_definitions",
+    "get_company_seed_lists",
+    "get_icp_keywords",
+    "get_organization_product_description",
+    "get_sender_profile",
+]
 
 
 def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[Dict[str, Any]]:
@@ -30,6 +39,81 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
         .execute()
     )
     return combos_res.data
+
+
+def get_company_seed_lists(
+    organization_id: str, seed_list_ids: List[str]
+) -> List[Dict[str, Any]]:
+    supabase = get_supabase()
+
+    res = (
+        supabase.table("org_company_seed_lists")
+        .select("*")
+        .eq("organization_id", organization_id)
+        .in_("id", seed_list_ids)
+        .execute()
+    )
+    return res.data
+
+
+def get_icp_keywords(organization_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch the org's ICP scoring keywords, grouped by category.
+
+    Categories: industry, ai_signal, decision_title, influencer_title. A
+    category missing from the config (or the whole table empty for this org)
+    simply yields an empty list — callers must score that as 0, not error.
+    """
+    supabase = get_supabase()
+
+    keywords_res = (
+        supabase.table("org_icp_keywords")
+        .select("category, keyword, weight")
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in keywords_res.data:
+        grouped[row["category"]].append({"keyword": row["keyword"], "weight": row["weight"]})
+    return dict(grouped)
+
+
+def get_organization_product_description(organization_id: str) -> Optional[str]:
+    """One-time, org-authored description of what the org sells.
+
+    May be unset for an org that hasn't filled it in yet — callers must
+    degrade gracefully (omit it from the prompt), not error or fabricate one.
+    """
+    supabase = get_supabase()
+
+    res = (
+        supabase.table("organizations")
+        .select("product_description")
+        .eq("id", organization_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not res.data:
+        return None
+    return res.data[0].get("product_description") or None
+
+
+def get_channel_hooks(organization_id: str) -> Dict[str, str]:
+    """Fetch the org's own BD Group pitch angle, keyed by channel_family.
+
+    A missing channel_family for this org simply has no entry — callers must
+    fall back to a generic angle, not error.
+    """
+    supabase = get_supabase()
+
+    res = (
+        supabase.table("org_channel_hooks")
+        .select("channel_family, hook_copy")
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+    return {row["channel_family"]: row["hook_copy"] for row in res.data}
 
 
 def get_sender_profile(profile_id: str) -> Optional[SenderProfile]:

@@ -180,6 +180,43 @@ def _fetch_page(
     return None
 
 
+def _paginate(
+    client: ApifyClient, request_id: str, limit: int, emit: LogFn
+) -> List[Dict[str, Any]]:
+    # Flow 2 — fetch results, paginating until we have enough leads or the
+    # actor returns a short (last) page. Shared by every search flow (title/geo
+    # combos, company-seed batches) once Flow 1 has handed back a request_id.
+    leads: List[Dict[str, Any]] = []
+    page = 1
+    while len(leads) < limit:
+        page_leads = _fetch_page(client, request_id, page, emit)
+        if page_leads is None:
+            break  # gave up waiting on "processing"
+        if not page_leads:
+            break  # no more results
+        leads.extend(page_leads)
+        if len(page_leads) < PAGE_SIZE:
+            break  # last page
+        page += 1
+
+    return leads[:limit]
+
+
+def _init_search(client: ApifyClient, init_input: Dict[str, Any], emit: LogFn) -> Optional[str]:
+    init_items = _call_actor(client, init_input)
+    init_response = _first_dict(init_items)
+    request_id = init_response.get("request_id")
+    emit(f"[Flow 1 init] request_id={request_id!r} message={init_response.get('message')!r}")
+    if not request_id:
+        emit("[Flow 1 init] no request_id returned; aborting")
+        return None
+
+    # Give the search backend a moment before fetching the first page.
+    emit(f"[Flow 1 init] waiting {INIT_WAIT_SECONDS}s before first fetch")
+    time.sleep(INIT_WAIT_SECONDS)
+    return request_id
+
+
 def _scrape_combo(
     client: ApifyClient,
     combo: Dict[str, Any],
@@ -200,34 +237,118 @@ def _scrape_combo(
     }
     emit(f"[Flow 1 init] input: {_dump(init_input)}")
 
-    init_items = _call_actor(client, init_input)
-    init_response = _first_dict(init_items)
-    request_id = init_response.get("request_id")
-    emit(f"[Flow 1 init] request_id={request_id!r} message={init_response.get('message')!r}")
+    request_id = _init_search(client, init_input, emit)
     if not request_id:
-        emit("[Flow 1 init] no request_id returned; aborting combo")
         return []
 
-    # Give the search backend a moment before fetching the first page.
-    emit(f"[Flow 1 init] waiting {INIT_WAIT_SECONDS}s before first fetch")
-    time.sleep(INIT_WAIT_SECONDS)
+    return _paginate(client, request_id, leads_for_combo, emit)
 
-    # Flow 2 — fetch results, paginating until we have enough leads or the
-    # actor returns a short (last) page.
-    leads: List[Dict[str, Any]] = []
-    page = 1
-    while len(leads) < leads_for_combo:
-        page_leads = _fetch_page(client, request_id, page, emit)
-        if page_leads is None:
-            break  # gave up waiting on "processing"
-        if not page_leads:
-            break  # no more results
-        leads.extend(page_leads)
-        if len(page_leads) < PAGE_SIZE:
-            break  # last page
-        page += 1
 
-    return leads[:leads_for_combo]
+# BD Group (company-seed) search is a genuinely different input shape from
+# the title/geo combo search above: it targets named companies instead of job
+# titles, and has no company_headcounts / posted_on_linkedin filters — that
+# matches how this search actually worked before the title/geo combo path
+# existed. It shares Flow 1 init + Flow 2 pagination via _init_search /
+# _paginate, but is a distinct entry point since the request shape differs.
+MAX_COMPANY_NAMES_PER_BATCH = 10
+MAX_TITLE_KEYWORDS_PER_BATCH = 20
+
+
+def _chunk_list(items: List[str], size: int) -> List[List[str]]:
+    if not items:
+        return [[]]
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _scrape_company_seed_batch(
+    client: ApifyClient,
+    company_names: List[str],
+    title_keywords: List[str],
+    seniority_levels: List[str],
+    geo_codes: List[str],
+    limit: int,
+    emit: LogFn,
+) -> List[Dict[str, Any]]:
+    init_input = {
+        "current_company_names": company_names,
+        "title_keywords": title_keywords,
+        "geo_codes": [int(code) for code in geo_codes],
+        "seniority_levels": seniority_levels,
+        "limit": limit,
+    }
+    emit(f"[BD Flow 1 init] input: {_dump(init_input)}")
+
+    request_id = _init_search(client, init_input, emit)
+    if not request_id:
+        return []
+
+    return _paginate(client, request_id, limit, emit)
+
+
+def run_company_seed_scraping(
+    apify_token: str,
+    seed_lists: List[Dict[str, Any]],
+    total_leads: int,
+    log_fn: Optional[LogFn] = None,
+) -> List[Dict[str, Any]]:
+    emit: LogFn = log_fn or log.info
+    client = ApifyClient(apify_token)
+
+    all_leads: List[Dict[str, Any]] = []
+    seen_linkedin_urls = set()
+
+    if not seed_lists:
+        return all_leads
+
+    leads_per_list = max(total_leads // len(seed_lists), 1)
+
+    for seed_list in seed_lists:
+        market = seed_list.get("market")
+        geo_codes = GEO_CODES.get((market or "").lower(), [])
+        company_names = seed_list.get("company_names") or []
+        title_keywords = seed_list.get("title_keywords") or []
+        seniority_levels = seed_list.get("seniority_levels") or []
+
+        company_batches = _chunk_list(company_names, MAX_COMPANY_NAMES_PER_BATCH)
+        title_batches = _chunk_list(title_keywords, MAX_TITLE_KEYWORDS_PER_BATCH)
+
+        list_leads: List[Dict[str, Any]] = []
+        for company_batch in company_batches:
+            if len(list_leads) >= leads_per_list:
+                break
+            for title_batch in title_batches:
+                if len(list_leads) >= leads_per_list:
+                    break
+                emit(
+                    f"[bd-seed] list={seed_list.get('list_name')!r} "
+                    f"companies={len(company_batch)} titles={len(title_batch)}"
+                )
+                batch_leads = _scrape_company_seed_batch(
+                    client,
+                    company_batch,
+                    title_batch,
+                    seniority_levels,
+                    geo_codes,
+                    leads_per_list - len(list_leads),
+                    emit,
+                )
+                list_leads.extend(batch_leads)
+
+        for lead in list_leads[:leads_per_list]:
+            if not isinstance(lead, dict):
+                continue
+
+            linkedin_url = lead.get("linkedin_url")
+            if not linkedin_url or linkedin_url in seen_linkedin_urls:
+                continue
+            seen_linkedin_urls.add(linkedin_url)
+
+            lead["market"] = market
+            lead["seed_list_id"] = seed_list.get("id")
+            lead["seed_list_name"] = seed_list.get("list_name")
+            all_leads.append(lead)
+
+    return all_leads
 
 
 def run_scraping(
