@@ -81,7 +81,11 @@ def _parse_response(text: str) -> Dict[str, str]:
     match = _JSON_BLOCK_RE.search(text)
     if not match:
         raise ValueError(f"No JSON object found in Claude response: {text}")
-    parsed = json.loads(match.group(0))
+    # Claude sometimes emits literal newlines/tabs inside JSON string values
+    # (e.g. "custom2": "Hola,\n\nGracias...") instead of the escaped \n form.
+    # strict=False allows raw control characters inside strings so a stray
+    # line break doesn't blow up the whole batch.
+    parsed = json.loads(match.group(0), strict=False)
     return {
         "custom1": (parsed.get("custom1") or "")[:CUSTOM1_MAX_CHARS],
         "custom2": (parsed.get("custom2") or "")[:CUSTOM2_MAX_CHARS],
