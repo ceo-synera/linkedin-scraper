@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 
 from api.config_generator import (
     get_combo_definitions,
-    get_icp_keywords,
     get_organization_product_description,
     get_sender_profile,
 )
@@ -135,9 +134,6 @@ async def run_job(run_request: RunRequest) -> None:
         combos = get_combo_definitions(organization_id, run_request.combos)
         log_run(run_id, "info", f"Loaded {len(combos)} combo definitions")
 
-        icp_keywords = get_icp_keywords(organization_id)
-        log_run(run_id, "info", f"Loaded ICP keywords for {len(icp_keywords)} categories")
-
         product_description = get_organization_product_description(organization_id)
 
         # Route the scraper's debug output into the CRM's run_logs.
@@ -150,7 +146,7 @@ async def run_job(run_request: RunRequest) -> None:
         )
         log_run(run_id, "info", f"Scraped {len(raw_leads)} raw leads")
 
-        scored_leads = score_leads(raw_leads, icp_keywords)
+        scored_leads = score_leads(raw_leads)
         log_run(run_id, "info", "Scored leads against ICP")
 
         new_leads, duplicates_count = dedup_leads(scored_leads, organization_id)

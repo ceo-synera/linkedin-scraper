@@ -1,4 +1,3 @@
-from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 from api.database import get_supabase
@@ -10,7 +9,6 @@ __all__ = [
     "get_channel_hooks",
     "get_combo_definitions",
     "get_company_seed_lists",
-    "get_icp_keywords",
     "get_organization_product_description",
     "get_sender_profile",
 ]
@@ -54,28 +52,6 @@ def get_company_seed_lists(
         .execute()
     )
     return res.data
-
-
-def get_icp_keywords(organization_id: str) -> Dict[str, List[Dict[str, Any]]]:
-    """Fetch the org's ICP scoring keywords, grouped by category.
-
-    Categories: industry, ai_signal, decision_title, influencer_title. A
-    category missing from the config (or the whole table empty for this org)
-    simply yields an empty list — callers must score that as 0, not error.
-    """
-    supabase = get_supabase()
-
-    keywords_res = (
-        supabase.table("org_icp_keywords")
-        .select("category, keyword, weight")
-        .eq("organization_id", organization_id)
-        .execute()
-    )
-
-    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for row in keywords_res.data:
-        grouped[row["category"]].append({"keyword": row["keyword"], "weight": row["weight"]})
-    return dict(grouped)
 
 
 def get_organization_product_description(organization_id: str) -> Optional[str]:
