@@ -42,4 +42,4 @@ class RunRequest(BaseModel):
     apify_token: str
     anthropic_key: str
     anthropic_base_url: Optional[str] = "https://api.anthropic.com"
-    anthropic_model: Optional[str] = "claude-sonnet-4-6"
+    anthropic_model: Optional[str] = "claude-sonnet-5"
