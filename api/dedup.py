@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Tuple
 from api.database import get_supabase
 
 
-def _chunk(items: List[str], size: int = 200) -> List[List[str]]:
+def _chunk(items: List[str], size: int = 50) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
