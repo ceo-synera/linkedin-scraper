@@ -87,6 +87,59 @@ def _normalize_company_headcounts(values: List[Any]) -> List[str]:
     return normalized
 
 
+# The actor only accepts these exact Sales Navigator seniority labels; any
+# other value makes it reject the whole input with InvalidRequestError.
+ALLOWED_SENIORITY_LEVELS = {
+    "Owner/Partner",
+    "CXO",
+    "Vice President",
+    "Director",
+    "Experienced Manager",
+    "Entry Level Manager",
+    "Strategic",
+    "Senior",
+    "Entry Level",
+    "In Training",
+}
+
+# High-confidence aliases the combos may store → the allowed labels. Anything
+# not matched here (or already exact) is dropped and logged, so an unexpected
+# value can never crash the run.
+SENIORITY_LEVEL_ALIASES = {
+    "owner": "Owner/Partner",
+    "partner": "Owner/Partner",
+    "owner/partner": "Owner/Partner",
+    "cxo": "CXO",
+    "c-level": "CXO",
+    "c level": "CXO",
+    "clevel": "CXO",
+    "vp": "Vice President",
+    "vice-president": "Vice President",
+}
+
+
+def _normalize_seniority_levels(values: List[Any], emit: LogFn) -> List[str]:
+    normalized: List[str] = []
+    dropped: List[str] = []
+    for value in values or []:
+        if not isinstance(value, str):
+            dropped.append(str(value))
+            continue
+        candidate = value.strip()
+        if candidate in ALLOWED_SENIORITY_LEVELS:
+            mapped = candidate
+        else:
+            mapped = SENIORITY_LEVEL_ALIASES.get(candidate.lower())
+        if mapped:
+            if mapped not in normalized:
+                normalized.append(mapped)
+        else:
+            dropped.append(candidate)
+    if dropped:
+        emit(f"[seniority] dropped unmapped values (not in actor enum): {dropped}")
+    return normalized
+
+
 def _run_field(run: Any, dict_key: str, attr_name: str) -> Any:
     # apify-client returns plain dicts (camelCase keys) on some versions and
     # typed Run objects (snake_case attributes) on others; support both.
@@ -232,7 +285,9 @@ def _scrape_combo(
         ),
         "geo_codes": [int(code) for code in geo_codes],
         "posted_on_linkedin": "true",
-        "seniority_levels": combo.get("seniority_levels", []),
+        "seniority_levels": _normalize_seniority_levels(
+            combo.get("seniority_levels", []), emit
+        ),
         "limit": leads_for_combo,
     }
     emit(f"[Flow 1 init] input: {_dump(init_input)}")
@@ -273,7 +328,7 @@ def _scrape_company_seed_batch(
         "current_company_names": company_names,
         "title_keywords": title_keywords,
         "geo_codes": [int(code) for code in geo_codes],
-        "seniority_levels": seniority_levels,
+        "seniority_levels": _normalize_seniority_levels(seniority_levels, emit),
         "limit": limit,
     }
     emit(f"[BD Flow 1 init] input: {_dump(init_input)}")
