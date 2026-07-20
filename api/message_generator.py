@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -6,10 +7,16 @@ import anthropic
 
 from api.models import SenderProfile
 
+log = logging.getLogger(__name__)
+
 # Fallbacks only — a sender profile's own connection_note_max_chars /
 # followup_max_chars win when set (see _resolve_char_limits).
 DEFAULT_CUSTOM1_MAX_CHARS = 300
 DEFAULT_CUSTOM2_MAX_CHARS = 500
+
+# Generous ceiling so custom1 + custom2 (in verbose languages like Spanish or
+# Chinese) don't get truncated mid-JSON and become unparseable.
+MESSAGE_MAX_TOKENS = 2048
 
 DEFAULT_LANGUAGE = "en"
 
@@ -150,18 +157,46 @@ Respond with ONLY a JSON object in this exact shape, no markdown fences, no extr
 {{"custom1": "...", "custom2": "..."}}"""
 
 
-def _parse_response(text: str, custom1_max: int, custom2_max: int) -> Dict[str, str]:
-    match = _JSON_BLOCK_RE.search(text)
+def _extract_field(text: str, key: str) -> str:
+    # Pull "key": "value" where value runs to the next unescaped quote, or to
+    # the end of the text if the response was truncated before the closing
+    # quote (max_tokens cut-off). Best-effort unescaping of the common escapes.
+    match = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)', text)
     if not match:
+        return ""
+    return (
+        match.group(1)
+        .replace('\\"', '"')
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+    )
+
+
+def _parse_response(text: str, custom1_max: int, custom2_max: int) -> Dict[str, str]:
+    # Preferred path: a well-formed JSON object. strict=False tolerates literal
+    # newlines/tabs inside string values (Claude sometimes emits raw instead of
+    # escaped \n).
+    match = _JSON_BLOCK_RE.search(text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0), strict=False)
+            return {
+                "custom1": (parsed.get("custom1") or "")[:custom1_max],
+                "custom2": (parsed.get("custom2") or "")[:custom2_max],
+            }
+        except (ValueError, json.JSONDecodeError):
+            pass  # fall through to salvage
+
+    # Salvage path: the response was truncated (no closing brace/quote) or
+    # otherwise not strict JSON. Recover custom1 / custom2 individually so a
+    # cut-off custom2 still keeps a usable custom1 instead of losing both.
+    custom1 = _extract_field(text, "custom1")
+    custom2 = _extract_field(text, "custom2")
+    if not custom1 and not custom2:
         raise ValueError(f"No JSON object found in Claude response: {text}")
-    # Claude sometimes emits literal newlines/tabs inside JSON string values
-    # (e.g. "custom2": "Hola,\n\nGracias...") instead of the escaped \n form.
-    # strict=False allows raw control characters inside strings so a stray
-    # line break doesn't blow up the whole batch.
-    parsed = json.loads(match.group(0), strict=False)
     return {
-        "custom1": (parsed.get("custom1") or "")[:custom1_max],
-        "custom2": (parsed.get("custom2") or "")[:custom2_max],
+        "custom1": custom1[:custom1_max],
+        "custom2": custom2[:custom2_max],
     }
 
 
@@ -203,17 +238,27 @@ def generate_messages_for_batch(
             custom1_max,
             custom2_max,
         )
-        response = client.messages.create(
-            model=anthropic_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        )
-        messages = _parse_response(text, custom1_max, custom2_max)
-        lead["custom1"] = messages["custom1"]
-        lead["custom2"] = messages["custom2"]
+        try:
+            response = client.messages.create(
+                model=anthropic_model,
+                max_tokens=MESSAGE_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            )
+            messages = _parse_response(text, custom1_max, custom2_max)
+            lead["custom1"] = messages["custom1"]
+            lead["custom2"] = messages["custom2"]
+        except Exception as exc:
+            # One bad/truncated response must not lose the whole batch's work.
+            log.warning(
+                "Message generation failed for lead %s: %s",
+                lead.get("linkedin_url"),
+                exc,
+            )
 
     return leads
 
@@ -254,16 +299,26 @@ def generate_bd_messages_for_batch(
             custom1_max,
             custom2_max,
         )
-        response = client.messages.create(
-            model=anthropic_model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(
-            block.text for block in response.content if getattr(block, "type", None) == "text"
-        )
-        messages = _parse_response(text, custom1_max, custom2_max)
-        lead["custom1"] = messages["custom1"]
-        lead["custom2"] = messages["custom2"]
+        try:
+            response = client.messages.create(
+                model=anthropic_model,
+                max_tokens=MESSAGE_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = "".join(
+                block.text
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            )
+            messages = _parse_response(text, custom1_max, custom2_max)
+            lead["custom1"] = messages["custom1"]
+            lead["custom2"] = messages["custom2"]
+        except Exception as exc:
+            # One bad/truncated response must not lose the whole batch's work.
+            log.warning(
+                "BD message generation failed for lead %s: %s",
+                lead.get("linkedin_url"),
+                exc,
+            )
 
     return leads
