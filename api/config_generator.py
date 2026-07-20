@@ -9,7 +9,6 @@ __all__ = [
     "get_channel_hooks",
     "get_combo_definitions",
     "get_company_seed_lists",
-    "get_organization_product_description",
     "get_sender_profile",
 ]
 
@@ -52,34 +51,6 @@ def get_company_seed_lists(
         .execute()
     )
     return res.data
-
-
-def get_organization_product_description(organization_id: str) -> Optional[str]:
-    """One-time, org-authored description of what the org sells.
-
-    May be unset for an org that hasn't filled it in yet, and the
-    product_description column may not even exist on this Supabase yet — in
-    both cases callers must degrade gracefully (omit it from the prompt), not
-    error or fabricate one.
-    """
-    supabase = get_supabase()
-
-    try:
-        res = (
-            supabase.table("organizations")
-            .select("product_description")
-            .eq("id", organization_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception:
-        # e.g. the product_description column doesn't exist yet (PGRST204 /
-        # 42703). Treat it as unset rather than failing the whole run.
-        return None
-
-    if not res.data:
-        return None
-    return res.data[0].get("product_description") or None
 
 
 def get_channel_hooks(organization_id: str) -> Dict[str, str]:

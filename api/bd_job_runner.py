@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional
 from api.config_generator import (
     get_channel_hooks,
     get_company_seed_lists,
-    get_organization_product_description,
     get_sender_profile,
 )
 from api.database import get_supabase, log_run, update_run_status
@@ -196,7 +195,6 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
 
         sender_profile = _resolve_sender_profile(request)
         language = sender_profile.language if sender_profile else "en"
-        product_description = get_organization_product_description(organization_id)
         hook_copy_by_channel_family = get_channel_hooks(organization_id)
 
         generate_bd_messages_for_batch(
@@ -207,7 +205,6 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
             language,
             request.anthropic_base_url,
             request.anthropic_model,
-            product_description=product_description,
             hook_copy_by_channel_family=hook_copy_by_channel_family,
         )
 

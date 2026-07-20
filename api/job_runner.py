@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 
 from api.config_generator import (
     get_combo_definitions,
-    get_organization_product_description,
     get_sender_profile,
 )
 from api.database import get_supabase, log_run, update_run_status
@@ -134,8 +133,6 @@ async def run_job(run_request: RunRequest) -> None:
         combos = get_combo_definitions(organization_id, run_request.combos)
         log_run(run_id, "info", f"Loaded {len(combos)} combo definitions")
 
-        product_description = get_organization_product_description(organization_id)
-
         # Route the scraper's debug output into the CRM's run_logs.
         raw_leads = run_scraping(
             run_request.apify_token,
@@ -208,7 +205,6 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.anthropic_base_url,
                 run_request.anthropic_model,
                 market=sdr_market,
-                product_description=product_description,
             )
 
             for lead in sdr_leads:
