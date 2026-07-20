@@ -367,36 +367,47 @@ def run_scraping(
     if not markets:
         return all_leads
 
-    leads_per_market = total_leads // len(markets)
+    # Flatten (market, combo) into cells and give each a dynamic target of the
+    # remaining shortfall spread over the cells still to come. A combo that
+    # returns fewer real matches than its share leaves `remaining` high, so
+    # later cells automatically pick up the slack — instead of the old fixed
+    # per-combo cap that could never recover an under-delivering combo. Only
+    # leads actually added (after within-run dedup) count toward the target.
+    cells = [(market, combo) for market in markets for combo in (combos or [{}])]
+    remaining = total_leads
 
-    for market in markets:
+    for index, (market, combo) in enumerate(cells):
+        if remaining <= 0:
+            break
+
+        cells_left = len(cells) - index
+        cell_target = max(-(-remaining // cells_left), 1)  # ceil division
         geo_codes = GEO_CODES.get(market.lower(), [])
-        combos_for_market = combos or [{}]
-        leads_per_combo = max(leads_per_market // len(combos_for_market), 1)
+        combo_code = combo.get("code") if isinstance(combo, dict) else None
+        emit(
+            f"[combo] market={market!r} code={combo_code!r} "
+            f"target={cell_target} remaining={remaining}"
+        )
+        combo_leads = _scrape_combo(client, combo, geo_codes, cell_target, emit)
 
-        for combo in combos_for_market:
-            emit(
-                f"[combo] market={market!r} code="
-                f"{combo.get('code') if isinstance(combo, dict) else None!r} "
-                f"leads_per_combo={leads_per_combo}"
-            )
-            combo_leads = _scrape_combo(client, combo, geo_codes, leads_per_combo, emit)
+        added = 0
+        for lead in combo_leads:
+            if not isinstance(lead, dict):
+                continue
 
-            for lead in combo_leads:
-                if not isinstance(lead, dict):
-                    continue
+            # Real profiles always carry a linkedin_url; skip anything without
+            # one and dedup within this run.
+            linkedin_url = lead.get("linkedin_url")
+            if not linkedin_url or linkedin_url in seen_linkedin_urls:
+                continue
+            seen_linkedin_urls.add(linkedin_url)
 
-                # Real profiles always carry a linkedin_url; skip anything
-                # without one and dedup within this run.
-                linkedin_url = lead.get("linkedin_url")
-                if not linkedin_url:
-                    continue
-                if linkedin_url in seen_linkedin_urls:
-                    continue
-                seen_linkedin_urls.add(linkedin_url)
+            lead["market"] = market
+            lead["combo"] = combo_code
+            all_leads.append(lead)
+            added += 1
 
-                lead["market"] = market
-                lead["combo"] = combo.get("code") if isinstance(combo, dict) else None
-                all_leads.append(lead)
+        remaining -= added
+        emit(f"[combo] market={market!r} code={combo_code!r} added={added} remaining={remaining}")
 
     return all_leads
