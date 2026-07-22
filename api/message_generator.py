@@ -1,13 +1,21 @@
+import asyncio
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import anthropic
 
 from api.models import SenderProfile
 
 log = logging.getLogger(__name__)
+
+# Max concurrent Claude calls per batch. The messages are generated in
+# parallel bounded by a semaphore so 90 leads don't run 90-at-a-time (which
+# would hammer the AITokenKing proxy and risk 429s) nor one-at-a-time (which
+# took ~8 min and caused 504s while the CRM polled the run). Lower to 3-4 if
+# the proxy starts returning 429 at 6.
+MESSAGE_CONCURRENCY = 6
 
 # Fallbacks only — a sender profile's own connection_note_max_chars /
 # followup_max_chars win when set (see _resolve_char_limits).
@@ -200,17 +208,68 @@ def _parse_response(text: str, custom1_max: int, custom2_max: int) -> Dict[str, 
     }
 
 
-def _build_client(anthropic_key: str, anthropic_base_url: str) -> anthropic.Anthropic:
+def _build_async_client(
+    anthropic_key: str, anthropic_base_url: str
+) -> anthropic.AsyncAnthropic:
     # The Anthropic SDK appends /v1 itself, so a base_url that already ends in
     # /v1 (e.g. https://api.aitokenking.com.tw/api/v1) would produce /v1/v1.
     # Strip a trailing /v1 before handing it to the client.
     base_url = anthropic_base_url.rstrip("/")
     if base_url.endswith("/v1"):
         base_url = base_url[:-3]
-    return anthropic.Anthropic(api_key=anthropic_key, base_url=base_url)
+    return anthropic.AsyncAnthropic(api_key=anthropic_key, base_url=base_url)
 
 
-def generate_messages_for_batch(
+async def _run_batch(
+    leads: List[Dict[str, Any]],
+    client: anthropic.AsyncAnthropic,
+    anthropic_model: str,
+    custom1_max: int,
+    custom2_max: int,
+    build_prompt: Callable[[Dict[str, Any]], str],
+    log_fn: Optional[Callable[[str], None]],
+) -> None:
+    # Generate messages for every lead concurrently, bounded by a semaphore so
+    # no more than MESSAGE_CONCURRENCY Claude calls are in flight at once.
+    semaphore = asyncio.Semaphore(MESSAGE_CONCURRENCY)
+    total = len(leads)
+    completed = 0
+
+    async def _process(lead: Dict[str, Any]) -> None:
+        nonlocal completed
+        prompt = build_prompt(lead)
+        async with semaphore:
+            try:
+                response = await client.messages.create(
+                    model=anthropic_model,
+                    max_tokens=MESSAGE_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = "".join(
+                    block.text
+                    for block in response.content
+                    if getattr(block, "type", None) == "text"
+                )
+                messages = _parse_response(text, custom1_max, custom2_max)
+                lead["custom1"] = messages["custom1"]
+                lead["custom2"] = messages["custom2"]
+            except Exception as exc:
+                # One bad/truncated response must not lose the whole batch.
+                log.warning(
+                    "Message generation failed for lead %s: %s",
+                    lead.get("linkedin_url"),
+                    exc,
+                )
+        # asyncio is single-threaded, so this counter is race-free. Log per
+        # completed batch rather than per individual message.
+        completed += 1
+        if log_fn and (completed % MESSAGE_CONCURRENCY == 0 or completed == total):
+            log_fn(f"Generated messages for {completed}/{total} leads")
+
+    await asyncio.gather(*(_process(lead) for lead in leads))
+
+
+async def generate_messages_for_batch(
     leads: List[Dict[str, Any]],
     anthropic_key: str,
     plan: str,
@@ -220,16 +279,19 @@ def generate_messages_for_batch(
     anthropic_model: str,
     market: Optional[str] = None,
     product_description: Optional[str] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
-    client = _build_client(anthropic_key, anthropic_base_url)
+    if not leads:
+        return leads
+
     custom1_max, custom2_max = _resolve_char_limits(sender_profile)
 
-    for lead in leads:
+    def build_prompt(lead: Dict[str, Any]) -> str:
         # Resolve language per lead: a batch can span markets when an SDR
         # covers several. Fall back to the batch-level market parameter.
         lead_market = lead.get("market") or market
         effective_language = _resolve_language(language, lead_market, sender_profile)
-        prompt = _build_prompt(
+        return _build_prompt(
             lead,
             plan,
             sender_profile,
@@ -238,32 +300,16 @@ def generate_messages_for_batch(
             custom1_max,
             custom2_max,
         )
-        try:
-            response = client.messages.create(
-                model=anthropic_model,
-                max_tokens=MESSAGE_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = "".join(
-                block.text
-                for block in response.content
-                if getattr(block, "type", None) == "text"
-            )
-            messages = _parse_response(text, custom1_max, custom2_max)
-            lead["custom1"] = messages["custom1"]
-            lead["custom2"] = messages["custom2"]
-        except Exception as exc:
-            # One bad/truncated response must not lose the whole batch's work.
-            log.warning(
-                "Message generation failed for lead %s: %s",
-                lead.get("linkedin_url"),
-                exc,
-            )
+
+    async with _build_async_client(anthropic_key, anthropic_base_url) as client:
+        await _run_batch(
+            leads, client, anthropic_model, custom1_max, custom2_max, build_prompt, log_fn
+        )
 
     return leads
 
 
-def generate_bd_messages_for_batch(
+async def generate_bd_messages_for_batch(
     leads: List[Dict[str, Any]],
     anthropic_key: str,
     plan: str,
@@ -273,6 +319,7 @@ def generate_bd_messages_for_batch(
     anthropic_model: str,
     product_description: Optional[str] = None,
     hook_copy_by_channel_family: Optional[Dict[str, str]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Same shape as generate_messages_for_batch, but for BD Group candidates:
     third-person partnership framing, org-authored hook_copy as the core
@@ -281,15 +328,17 @@ def generate_bd_messages_for_batch(
     Deliberately not wired into scraping — callers only invoke this for
     already human-confirmed scraper_leads rows.
     """
-    client = _build_client(anthropic_key, anthropic_base_url)
+    if not leads:
+        return leads
+
     custom1_max, custom2_max = _resolve_char_limits(sender_profile)
     hook_copy_by_channel_family = hook_copy_by_channel_family or {}
 
-    for lead in leads:
+    def build_prompt(lead: Dict[str, Any]) -> str:
         lead_market = lead.get("market")
         effective_language = _resolve_language(language, lead_market, sender_profile)
         hook_copy = hook_copy_by_channel_family.get(lead.get("channel_family"))
-        prompt = _build_bd_prompt(
+        return _build_bd_prompt(
             lead,
             plan,
             sender_profile,
@@ -299,26 +348,10 @@ def generate_bd_messages_for_batch(
             custom1_max,
             custom2_max,
         )
-        try:
-            response = client.messages.create(
-                model=anthropic_model,
-                max_tokens=MESSAGE_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = "".join(
-                block.text
-                for block in response.content
-                if getattr(block, "type", None) == "text"
-            )
-            messages = _parse_response(text, custom1_max, custom2_max)
-            lead["custom1"] = messages["custom1"]
-            lead["custom2"] = messages["custom2"]
-        except Exception as exc:
-            # One bad/truncated response must not lose the whole batch's work.
-            log.warning(
-                "BD message generation failed for lead %s: %s",
-                lead.get("linkedin_url"),
-                exc,
-            )
+
+    async with _build_async_client(anthropic_key, anthropic_base_url) as client:
+        await _run_batch(
+            leads, client, anthropic_model, custom1_max, custom2_max, build_prompt, log_fn
+        )
 
     return leads

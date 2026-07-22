@@ -196,7 +196,7 @@ async def run_job(run_request: RunRequest) -> None:
                 if assignment and assignment.assigned_markets
                 else None
             )
-            generate_messages_for_batch(
+            await generate_messages_for_batch(
                 sdr_leads,
                 run_request.anthropic_key,
                 run_request.plan,
@@ -205,6 +205,7 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.anthropic_base_url,
                 run_request.anthropic_model,
                 market=sdr_market,
+                log_fn=lambda msg: log_run(run_id, "info", msg),
             )
 
             for lead in sdr_leads:

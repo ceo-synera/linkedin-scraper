@@ -197,7 +197,7 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
         language = sender_profile.language if sender_profile else "en"
         hook_copy_by_channel_family = get_channel_hooks(organization_id)
 
-        generate_bd_messages_for_batch(
+        await generate_bd_messages_for_batch(
             leads,
             request.anthropic_key,
             request.plan,
@@ -206,6 +206,7 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
             request.anthropic_base_url,
             request.anthropic_model,
             hook_copy_by_channel_family=hook_copy_by_channel_family,
+            log_fn=lambda msg: log_run(run_id, "info", msg),
         )
 
         for lead in leads:
