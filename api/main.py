@@ -25,6 +25,12 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# apify-client streams the actor run's own log lines ("[apify.<actor> ...]").
+# We disable that streaming at the call site (logger=None); quiet these here too
+# as a backstop so any residual apify-client line doesn't show up as an error.
+logging.getLogger("apify").setLevel(logging.WARNING)
+logging.getLogger("apify_client").setLevel(logging.WARNING)
+
 app = FastAPI(title="LinkedIn CRM & Outreach Platform - Scraper Backend", version="1.0.0")
 
 app.add_middleware(

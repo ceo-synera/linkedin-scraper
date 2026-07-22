@@ -13,8 +13,10 @@ LogFn = Callable[[str], None]
 
 
 def _dump(value: Any) -> str:
+    # Compact single-line JSON: a payload must be one log line, not twenty
+    # (indent=2 split each dict into many lines in Railway).
     try:
-        return json.dumps(value, indent=2, default=str)
+        return json.dumps(value, default=str)
     except (TypeError, ValueError):
         return repr(value)
 
@@ -155,7 +157,12 @@ def _call_actor(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
     # the run finishes and returns the Run; the actor's response is whatever it
     # pushes to its default dataset. Return the full item list so callers can
     # log it verbatim for debugging.
-    run = client.actor(ACTOR_ID).call(run_input=run_input)
+    #
+    # logger=None disables apify-client's default actor-log streaming — the
+    # "[apify.<actor> runId:...] Status: RUNNING/SUCCEEDED" lines it prints,
+    # which Railway tagged as errors. Our own [Flow ...] logs already narrate
+    # the run.
+    run = client.actor(ACTOR_ID).call(run_input=run_input, logger=None)
     dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
     if not dataset_id:
         return []
