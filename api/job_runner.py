@@ -128,12 +128,18 @@ async def run_job(run_request: RunRequest) -> None:
         os.makedirs(run_dir, exist_ok=True)
 
         update_run_status(run_id, "running")
-        log_run(run_id, "info", "Run started")
+        log_run(
+            run_id,
+            "info",
+            f"Run started — markets: {run_request.markets}, "
+            f"combos: {run_request.combos}, total_leads: {run_request.total_leads}",
+        )
 
         combos = get_combo_definitions(organization_id, run_request.combos)
-        log_run(run_id, "info", f"Loaded {len(combos)} combo definitions")
+        log_run(run_id, "info", f"Loaded {len(combos)} combo definition(s)")
 
         # Route the scraper's debug output into the CRM's run_logs.
+        log_run(run_id, "info", "Searching LinkedIn via Apify...")
         raw_leads = run_scraping(
             run_request.apify_token,
             combos,
@@ -141,26 +147,34 @@ async def run_job(run_request: RunRequest) -> None:
             run_request.total_leads,
             log_fn=lambda msg: log_run(run_id, "info", msg),
         )
-        log_run(run_id, "info", f"Scraped {len(raw_leads)} raw leads")
+        log_run(run_id, "info", f"Received {len(raw_leads)} raw leads from Apify")
 
+        log_run(run_id, "info", "Scoring leads...")
         scored_leads = score_leads(raw_leads)
-        log_run(run_id, "info", "Scored leads against ICP")
+        scored_hot = sum(1 for lead in scored_leads if lead.get("icp_tier") == "HOT")
+        scored_warm = sum(1 for lead in scored_leads if lead.get("icp_tier") == "WARM")
+        scored_cold = sum(1 for lead in scored_leads if lead.get("icp_tier") == "COLD")
+        log_run(
+            run_id,
+            "info",
+            f"Scored: {scored_hot} HOT, {scored_warm} WARM, {scored_cold} COLD",
+        )
 
+        log_run(run_id, "info", "Checking for duplicates...")
         new_leads, duplicates_count = dedup_leads(scored_leads, organization_id)
         log_run(
             run_id,
             "info",
-            f"Dedup complete: {len(new_leads)} new leads, {duplicates_count} duplicates",
+            f"Dedup complete: {len(new_leads)} new leads, "
+            f"{duplicates_count} duplicates skipped",
         )
 
         # Distribute to SDRs and generate outreach messages per SDR batch.
+        log_run(
+            run_id, "info", f"Distributing leads across {len(run_request.sdr_assignments)} SDRs..."
+        )
         distribution = distribute_leads(new_leads, run_request.sdr_assignments)
         assigned_count = sum(len(sdr_leads) for sdr_leads in distribution.values())
-        log_run(
-            run_id,
-            "info",
-            f"Distributed {assigned_count} leads across {len(distribution)} SDRs",
-        )
 
         # Distribution matches lead.market against assignment.assigned_markets
         # with an exact (case-sensitive) string compare. If nothing was assigned
@@ -182,6 +196,13 @@ async def run_job(run_request: RunRequest) -> None:
         assignments_by_sdr = {
             assignment.sdr_id: assignment for assignment in run_request.sdr_assignments
         }
+
+        if assigned_count:
+            log_run(
+                run_id,
+                "info",
+                "Generating personalized messages (this may take a moment)...",
+            )
 
         for sdr_id, sdr_leads in distribution.items():
             if not sdr_leads:
@@ -219,8 +240,8 @@ async def run_job(run_request: RunRequest) -> None:
 
         # Store leads + messages in scraper_leads. prospects is inserted later
         # by the CRM (it owns area_id / assignment context).
+        log_run(run_id, "info", "Saving leads to database...")
         import_leads_to_supabase(new_leads, run_id, organization_id)
-        log_run(run_id, "info", f"Stored {len(new_leads)} leads in scraper_leads")
 
         # Best-effort bookkeeping: a schema mismatch here must not fail a run
         # whose leads + messages were already stored.
@@ -237,7 +258,9 @@ async def run_job(run_request: RunRequest) -> None:
             "completed",
             total_leads=len(new_leads),
         )
-        log_run(run_id, "info", "Run completed")
+        log_run(
+            run_id, "info", f"Run completed successfully — {len(new_leads)} leads ready"
+        )
 
     except Exception as exc:
         log_run(run_id, "error", f"Run failed: {exc}")

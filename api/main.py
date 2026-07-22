@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +11,19 @@ from api.database import get_supabase
 from api.job_runner import run_job
 from api.models import BDMessageRequest, BDRunRequest, RunRequest
 
-logging.basicConfig(level=logging.INFO)
+# Send all logs to stdout (not the default stderr) so Railway doesn't tag every
+# normal INFO line as "error". force=True replaces any handler uvicorn set up.
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+
+# httpx logs every single HTTP request at INFO (each Supabase/Apify call as its
+# own line) — far too noisy. Only surface it when something actually breaks.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI(title="LinkedIn CRM & Outreach Platform - Scraper Backend", version="1.0.0")
 

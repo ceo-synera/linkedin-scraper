@@ -1,9 +1,12 @@
+import logging
 import os
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Optional
 
 from supabase import Client, create_client
+
+log = logging.getLogger("scraper")
 
 
 def _normalize_supabase_url(url: str) -> str:
@@ -31,6 +34,15 @@ def get_supabase() -> Client:
 
 
 def log_run(run_id: str, level: str, message: str) -> None:
+    # Emit to Railway stdout with the right severity first (so it shows even if
+    # the Supabase insert fails), then persist to run_logs for the CRM's
+    # real-time view. Only genuine errors go out at ERROR level so Railway
+    # doesn't paint normal progress lines red.
+    if level == "error":
+        log.error(message)
+    else:
+        log.info(message)
+
     supabase = get_supabase()
     supabase.table("run_logs").insert(
         {
