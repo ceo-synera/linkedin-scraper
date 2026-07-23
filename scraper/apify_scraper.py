@@ -69,7 +69,7 @@ MAX_COMBO_PAGES = 3
 # whole run's total_leads, each with its own overfetch + up to MAX_COMBO_PAGES
 # pagination, stretching a run to many minutes. No cell may be asked for more
 # than this multiplier times its fair share of the run's original total_leads.
-MAX_CELL_TARGET_MULTIPLIER = 2.5
+MAX_CELL_TARGET_MULTIPLIER = 2.0
 
 # The actor only accepts these exact company-headcount range labels.
 ALLOWED_COMPANY_HEADCOUNTS = {
