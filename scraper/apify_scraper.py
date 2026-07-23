@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -61,6 +62,14 @@ OVERFETCH_MULTIPLIER = 1.7
 # page 1) a single combo will fetch while trying to reach its requested
 # new-lead count via the preliminary per-page DB dedup check.
 MAX_COMBO_PAGES = 3
+
+# Safety valve on the cross-cell compensation below: without it, a cell late
+# in the run can inherit the ENTIRE deficit of every underperforming cell
+# before it, with no ceiling — one narrow combo could end up targeted for the
+# whole run's total_leads, each with its own overfetch + up to MAX_COMBO_PAGES
+# pagination, stretching a run to many minutes. No cell may be asked for more
+# than this multiplier times its fair share of the run's original total_leads.
+MAX_CELL_TARGET_MULTIPLIER = 2.5
 
 # The actor only accepts these exact company-headcount range labels.
 ALLOWED_COMPANY_HEADCOUNTS = {
@@ -602,6 +611,12 @@ def run_scraping(
     cells = [(market, combo) for market in markets for combo in (combos or [{}])]
     remaining = total_leads
 
+    # Fixed for the whole run — the original fair share if every cell had
+    # performed equally, not recomputed against cells_left like cell_target is.
+    fair_share_cap = math.ceil(
+        (total_leads / len(cells)) * MAX_CELL_TARGET_MULTIPLIER
+    )
+
     for index, (market, combo) in enumerate(cells):
         if remaining <= 0:
             break
@@ -610,6 +625,15 @@ def run_scraping(
         cell_target = max(-(-remaining // cells_left), 1)  # ceil division
         geo_codes = [geo_code_by_market[market]]
         combo_code = combo.get("code") if isinstance(combo, dict) else None
+
+        if cell_target > fair_share_cap:
+            emit(
+                f"[combo] market={market!r} code={combo_code!r} target capped at "
+                f"{fair_share_cap} (fair share ceiling), some leads may fall "
+                "short of total_leads requested"
+            )
+            cell_target = fair_share_cap
+
         emit(
             f"[combo] market={market!r} code={combo_code!r} "
             f"target={cell_target} remaining={remaining}"
