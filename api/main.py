@@ -7,7 +7,6 @@ from typing import Any, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.bd_job_runner import run_bd_job, run_bd_messages_job
 from api.bridge_job_runner import run_bridge_job
 from api.bridge_models import (
     BridgeCandidateUpdate,
@@ -16,7 +15,7 @@ from api.bridge_models import (
 )
 from api.database import get_supabase
 from api.job_runner import run_job
-from api.models import BDMessageRequest, BDRunRequest, RunRequest
+from api.models import RunRequest
 
 # Send all logs to stdout (not the default stderr) so Railway doesn't tag every
 # normal INFO line as "error". force=True replaces any handler uvicorn set up.
@@ -130,50 +129,6 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
     active_tasks[run_request.run_id] = task
 
     return {"run_id": run_request.run_id, "status": "started"}
-
-
-@app.post("/bd-runs")
-async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
-    existing = await asyncio.to_thread(_fetch_run_status, bd_run_request.run_id)
-
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    _assert_owned_by_org(existing.data[0], bd_run_request.organization_id)
-
-    if existing.data[0]["status"] != "pending":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Run is not pending (current status: {existing.data[0]['status']})",
-        )
-
-    def _on_done(task: asyncio.Task, run_id: str = bd_run_request.run_id) -> None:
-        active_tasks.pop(run_id, None)
-
-    task = asyncio.create_task(run_bd_job(bd_run_request))
-    task.add_done_callback(_on_done)
-    active_tasks[bd_run_request.run_id] = task
-
-    return {"run_id": bd_run_request.run_id, "status": "started"}
-
-
-@app.post("/bd-runs/{run_id}/messages")
-async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) -> Dict[str, str]:
-    existing = await asyncio.to_thread(_fetch_run_status, run_id)
-
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    _assert_owned_by_org(existing.data[0], message_request.organization_id)
-
-    def _on_done(task: asyncio.Task, run_id: str = run_id) -> None:
-        active_tasks.pop(run_id, None)
-
-    task = asyncio.create_task(run_bd_messages_job(run_id, message_request))
-    task.add_done_callback(_on_done)
-    active_tasks[run_id] = task
-
-    return {"run_id": run_id, "status": "started"}
 
 
 @app.get("/runs/{run_id}")

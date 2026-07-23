@@ -5,6 +5,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from apify_client import ApifyClient
 
+try:  # present on the apify-client versions we run (1.8+)
+    from apify_client.errors import InvalidRequestError
+except ImportError:  # pragma: no cover - defensive against client layout changes
+    InvalidRequestError = None
+
 # NOTE: this crosses the scraper/api boundary — scraper/ is otherwise
 # Apify-only (no DB, no secrets persisted). It's needed here so a combo can
 # check, page by page, whether Apify's results are actually new-to-DB before
@@ -378,111 +383,15 @@ def _scrape_combo(
     return new_leads
 
 
-# BD Group (company-seed) search is a genuinely different input shape from
-# the title/geo combo search above: it targets named companies instead of job
-# titles, and has no company_headcounts / posted_on_linkedin filters — that
-# matches how this search actually worked before the title/geo combo path
-# existed. It shares Flow 1 init + Flow 2 pagination via _init_search /
-# _paginate, but is a distinct entry point since the request shape differs.
+# Company-name batching, shared by Bridge's run_bridge_scraping: the actor
+# only accepts a limited number of current_company_names per request.
 MAX_COMPANY_NAMES_PER_BATCH = 10
-MAX_TITLE_KEYWORDS_PER_BATCH = 20
 
 
 def _chunk_list(items: List[str], size: int) -> List[List[str]]:
     if not items:
         return [[]]
     return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def _scrape_company_seed_batch(
-    client: ApifyClient,
-    company_names: List[str],
-    title_keywords: List[str],
-    seniority_levels: List[str],
-    geo_codes: List[str],
-    limit: int,
-    emit: LogFn,
-) -> List[Dict[str, Any]]:
-    init_input = {
-        "current_company_names": company_names,
-        "title_keywords": title_keywords,
-        "geo_codes": [int(code) for code in geo_codes],
-        "seniority_levels": _normalize_seniority_levels(seniority_levels, emit),
-        "limit": limit,
-    }
-    emit(f"[BD Flow 1 init] input: {_dump(init_input)}")
-
-    request_id = _init_search(client, init_input, emit)
-    if not request_id:
-        return []
-
-    return _paginate(client, request_id, limit, emit)
-
-
-def run_company_seed_scraping(
-    apify_token: str,
-    seed_lists: List[Dict[str, Any]],
-    total_leads: int,
-    log_fn: Optional[LogFn] = None,
-) -> List[Dict[str, Any]]:
-    emit: LogFn = log_fn or log.info
-    client = ApifyClient(apify_token)
-
-    all_leads: List[Dict[str, Any]] = []
-    seen_linkedin_urls = set()
-
-    if not seed_lists:
-        return all_leads
-
-    leads_per_list = max(total_leads // len(seed_lists), 1)
-
-    for seed_list in seed_lists:
-        market = seed_list.get("market")
-        geo_codes = GEO_CODES.get((market or "").lower(), [])
-        company_names = seed_list.get("company_names") or []
-        title_keywords = seed_list.get("title_keywords") or []
-        seniority_levels = seed_list.get("seniority_levels") or []
-
-        company_batches = _chunk_list(company_names, MAX_COMPANY_NAMES_PER_BATCH)
-        title_batches = _chunk_list(title_keywords, MAX_TITLE_KEYWORDS_PER_BATCH)
-
-        list_leads: List[Dict[str, Any]] = []
-        for company_batch in company_batches:
-            if len(list_leads) >= leads_per_list:
-                break
-            for title_batch in title_batches:
-                if len(list_leads) >= leads_per_list:
-                    break
-                emit(
-                    f"[bd-seed] list={seed_list.get('list_name')!r} "
-                    f"companies={len(company_batch)} titles={len(title_batch)}"
-                )
-                batch_leads = _scrape_company_seed_batch(
-                    client,
-                    company_batch,
-                    title_batch,
-                    seniority_levels,
-                    geo_codes,
-                    leads_per_list - len(list_leads),
-                    emit,
-                )
-                list_leads.extend(batch_leads)
-
-        for lead in list_leads[:leads_per_list]:
-            if not isinstance(lead, dict):
-                continue
-
-            linkedin_url = lead.get("linkedin_url")
-            if not linkedin_url or linkedin_url in seen_linkedin_urls:
-                continue
-            seen_linkedin_urls.add(linkedin_url)
-
-            lead["market"] = market
-            lead["seed_list_id"] = seed_list.get("id")
-            lead["seed_list_name"] = seed_list.get("list_name")
-            all_leads.append(lead)
-
-    return all_leads
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +435,42 @@ BRIDGE_RESULTS_PER_COMPANY = 3
 # headcount / geo), so there's no per-company anchor to scale the limit from.
 # Cap it at a single page.
 BRIDGE_FILTER_ONLY_LIMIT = PAGE_SIZE
+
+
+def _is_invalid_input_error(exc: Exception) -> bool:
+    # Prefer the typed error; fall back to the message so a client-layout
+    # change can't silently disable the retry.
+    if InvalidRequestError is not None and isinstance(exc, InvalidRequestError):
+        return True
+    return "Input is not valid" in str(exc)
+
+
+def _init_bridge_search(
+    client: ApifyClient, init_input: Dict[str, Any], emit: LogFn
+) -> Optional[str]:
+    """Flow 1 for Bridge, tolerating an actor that rejects industry_codes.
+
+    industry_codes isn't a field we've confirmed the actor accepts. Since the
+    actor rejects the *entire* input on an unknown/invalid field, sending it
+    blind would fail the whole run. Instead: try with it, and if the actor
+    rejects the input, retry once without it — losing that one filter rather
+    than the run.
+    """
+    try:
+        return _init_search(client, init_input, emit)
+    except Exception as exc:
+        if "industry_codes" not in init_input or not _is_invalid_input_error(exc):
+            raise
+
+        emit(
+            "[bridge] industry_codes not supported by actor, retrying without it "
+            f"(actor said: {exc})"
+        )
+        fallback_input = {
+            key: value for key, value in init_input.items() if key != "industry_codes"
+        }
+        emit(f"[Bridge Flow 1 init] retry input: {_dump(fallback_input)}")
+        return _init_search(client, fallback_input, emit)
 
 
 def run_bridge_scraping(
@@ -585,7 +530,7 @@ def run_bridge_scraping(
         )
         emit(f"[Bridge Flow 1 init] input: {_dump(init_input)}")
 
-        request_id = _init_search(client, init_input, emit)
+        request_id = _init_bridge_search(client, init_input, emit)
         if not request_id:
             continue
 

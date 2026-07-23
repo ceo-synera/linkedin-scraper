@@ -6,9 +6,7 @@ from scraper.apify_scraper import GEO_CODES
 
 __all__ = [
     "GEO_CODES",
-    "get_channel_hooks",
     "get_combo_definitions",
-    "get_company_seed_lists",
     "get_sender_profile",
 ]
 
@@ -36,38 +34,6 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
         .execute()
     )
     return combos_res.data
-
-
-def get_company_seed_lists(
-    organization_id: str, seed_list_ids: List[str]
-) -> List[Dict[str, Any]]:
-    supabase = get_supabase()
-
-    res = (
-        supabase.table("org_company_seed_lists")
-        .select("*")
-        .eq("organization_id", organization_id)
-        .in_("id", seed_list_ids)
-        .execute()
-    )
-    return res.data
-
-
-def get_channel_hooks(organization_id: str) -> Dict[str, str]:
-    """Fetch the org's own BD Group pitch angle, keyed by channel_family.
-
-    A missing channel_family for this org simply has no entry — callers must
-    fall back to a generic angle, not error.
-    """
-    supabase = get_supabase()
-
-    res = (
-        supabase.table("org_channel_hooks")
-        .select("channel_family, hook_copy")
-        .eq("organization_id", organization_id)
-        .execute()
-    )
-    return {row["channel_family"]: row["hook_copy"] for row in res.data}
 
 
 def get_sender_profile(

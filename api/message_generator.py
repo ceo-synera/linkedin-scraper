@@ -126,61 +126,6 @@ Respond with ONLY a JSON object in this exact shape, no markdown fences, no extr
 {{"custom1": "...", "custom2": "..."}}"""
 
 
-def _build_product_context(product_description: Optional[str]) -> str:
-    # BD Group pipeline only — separate from the SDR pipeline's
-    # company_context above. The org may not have filled this in yet — omit
-    # the section entirely rather than error or insert a fake-looking
-    # placeholder.
-    if not product_description:
-        return ""
-    return f"\nWhat this company actually sells: {product_description}\n"
-
-
-def _build_bd_prompt(
-    lead: Dict[str, Any],
-    plan: str,
-    sender_profile: Optional[SenderProfile],
-    language: str,
-    product_description: Optional[str],
-    hook_copy: Optional[str],
-    custom1_max: int,
-    custom2_max: int,
-) -> str:
-    sender_context = _build_sender_context(plan, sender_profile)
-    product_context = _build_product_context(product_description)
-    lead_name = lead.get("full_name") or lead.get("name") or "the contact"
-    lead_title = lead.get("title") or lead.get("job_title") or ""
-    lead_company = lead.get("company") or ""
-
-    hook_line = (
-        f"\nThe org's own angle for this type of partner — lead with this, don't invent a generic pitch:\n{hook_copy}\n"
-        if hook_copy
-        else ""
-    )
-
-    return f"""{sender_context}
-{product_context}
-This is BD Group outreach: {lead_name} ({lead_title} at {lead_company}) is a potential CHANNEL
-PARTNER, not a direct buyer. Frame the message in THIRD PERSON — talk about how THEIR customers
-would benefit ("your customers dealing with X..."), never "you have this problem". This is a
-partnership pitch, not a direct sales pitch.
-{hook_line}
-Write two LinkedIn outreach messages in {language} for this contact:
-- Name: {lead_name}
-- Title: {lead_title}
-- Company: {lead_company}
-
-1. custom1: a LinkedIn connection request note, maximum {custom1_max} characters. This reads as a
-   partnership introduction, not a terse cold pitch — use a meaningfully larger share of that
-   limit than a brief one-liner would.
-2. custom2: a follow-up message sent after the connection is accepted, maximum {custom2_max}
-   characters. Same guidance: make full, substantive use of the available space rather than
-   writing something minimal.
-
-Respond with ONLY a JSON object in this exact shape, no markdown fences, no extra text:
-{{"custom1": "...", "custom2": "..."}}"""
-
-
 def _extract_field(text: str, key: str) -> str:
     # Pull "key": "value" where value runs to the next unescaped quote, or to
     # the end of the text if the response was truncated before the closing
@@ -316,54 +261,6 @@ async def generate_messages_for_batch(
             sender_profile,
             effective_language,
             company_context,
-            custom1_max,
-            custom2_max,
-        )
-
-    async with _build_async_client(anthropic_key, anthropic_base_url) as client:
-        await _run_batch(
-            leads, client, anthropic_model, custom1_max, custom2_max, build_prompt, log_fn
-        )
-
-    return leads
-
-
-async def generate_bd_messages_for_batch(
-    leads: List[Dict[str, Any]],
-    anthropic_key: str,
-    plan: str,
-    sender_profile: Optional[SenderProfile],
-    language: str,
-    anthropic_base_url: str,
-    anthropic_model: str,
-    product_description: Optional[str] = None,
-    hook_copy_by_channel_family: Optional[Dict[str, str]] = None,
-    log_fn: Optional[Callable[[str], None]] = None,
-) -> List[Dict[str, Any]]:
-    """Same shape as generate_messages_for_batch, but for BD Group candidates:
-    third-person partnership framing, org-authored hook_copy as the core
-    angle, and a fuller message within the sender's real character ceiling.
-
-    Deliberately not wired into scraping — callers only invoke this for
-    already human-confirmed scraper_leads rows.
-    """
-    if not leads:
-        return leads
-
-    custom1_max, custom2_max = _resolve_char_limits(sender_profile)
-    hook_copy_by_channel_family = hook_copy_by_channel_family or {}
-
-    def build_prompt(lead: Dict[str, Any]) -> str:
-        lead_market = lead.get("market")
-        effective_language = _resolve_language(language, lead_market, sender_profile)
-        hook_copy = hook_copy_by_channel_family.get(lead.get("channel_family"))
-        return _build_bd_prompt(
-            lead,
-            plan,
-            sender_profile,
-            effective_language,
-            product_description,
-            hook_copy,
             custom1_max,
             custom2_max,
         )

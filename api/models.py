@@ -48,34 +48,3 @@ class RunRequest(BaseModel):
     anthropic_model: Optional[str] = "claude-sonnet-4-6"
 
 
-class BDRunRequest(BaseModel):
-    """BD Group run: search by named target companies instead of job titles.
-
-    Deliberately separate from RunRequest — a distinct pipeline with a single
-    owning SDR (no even-split/multi-SDR distribution) and no scoring/messaging
-    fields yet (those are later phases).
-    """
-
-    run_id: str
-    organization_id: str
-    seed_list_ids: List[str]
-    owner_sdr_id: str
-    total_leads: int
-    apify_token: str
-
-
-class BDMessageRequest(BaseModel):
-    """Generate outreach messages for a set of already human-confirmed BD Group
-    candidates. Deliberately separate from run creation — messages are only
-    ever generated on demand for confirmed rows, never automatically for every
-    raw scraped candidate.
-    """
-
-    organization_id: str
-    lead_ids: List[str]
-    plan: Plan
-    sender_profile_id: Optional[str] = None
-    sender_profile: Optional[SenderProfile] = None
-    anthropic_key: str
-    anthropic_base_url: Optional[str] = "https://api.anthropic.com"
-    anthropic_model: Optional[str] = "claude-sonnet-4-6"
