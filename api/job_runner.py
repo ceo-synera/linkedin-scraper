@@ -248,6 +248,7 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.anthropic_base_url,
                 run_request.anthropic_model,
                 market=sdr_market,
+                company_context=run_request.company_context,
                 log_fn=lambda msg: log_run(run_id, "info", msg),
             )
 

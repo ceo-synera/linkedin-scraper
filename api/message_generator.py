@@ -83,12 +83,18 @@ def _build_sender_context(plan: str, sender_profile: Optional[SenderProfile]) ->
     return "\n".join(lines)
 
 
-def _build_product_context(product_description: Optional[str]) -> str:
-    # The org may not have filled this in yet — omit the section entirely
-    # rather than error or insert a fake-looking placeholder.
-    if not product_description:
+def _build_company_context(company_context: str) -> str:
+    # The org's admin may not have configured this yet — omit the section
+    # entirely rather than error or insert a fake-looking placeholder, so
+    # behavior is unchanged for orgs without it set.
+    if not company_context:
         return ""
-    return f"\nWhat this company actually sells: {product_description}\n"
+    return (
+        f"\nCompany context: {company_context}\n\n"
+        "Use this context naturally when relevant to the lead's role or "
+        "company — don't force it into every message, but let it inform how "
+        "you position the outreach when it makes sense.\n"
+    )
 
 
 def _build_prompt(
@@ -96,18 +102,18 @@ def _build_prompt(
     plan: str,
     sender_profile: Optional[SenderProfile],
     language: str,
-    product_description: Optional[str],
+    company_context: str,
     custom1_max: int,
     custom2_max: int,
 ) -> str:
     sender_context = _build_sender_context(plan, sender_profile)
-    product_context = _build_product_context(product_description)
+    company_context_block = _build_company_context(company_context)
     lead_name = lead.get("full_name") or lead.get("name") or "the prospect"
     lead_title = lead.get("title") or lead.get("job_title") or ""
     lead_company = lead.get("company") or ""
 
     return f"""{sender_context}
-{product_context}
+{company_context_block}
 Write two LinkedIn outreach messages in {language} for this prospect:
 - Name: {lead_name}
 - Title: {lead_title}
@@ -118,6 +124,16 @@ Write two LinkedIn outreach messages in {language} for this prospect:
 
 Respond with ONLY a JSON object in this exact shape, no markdown fences, no extra text:
 {{"custom1": "...", "custom2": "..."}}"""
+
+
+def _build_product_context(product_description: Optional[str]) -> str:
+    # BD Group pipeline only — separate from the SDR pipeline's
+    # company_context above. The org may not have filled this in yet — omit
+    # the section entirely rather than error or insert a fake-looking
+    # placeholder.
+    if not product_description:
+        return ""
+    return f"\nWhat this company actually sells: {product_description}\n"
 
 
 def _build_bd_prompt(
@@ -281,7 +297,7 @@ async def generate_messages_for_batch(
     anthropic_base_url: str,
     anthropic_model: str,
     market: Optional[str] = None,
-    product_description: Optional[str] = None,
+    company_context: str = "",
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     if not leads:
@@ -299,7 +315,7 @@ async def generate_messages_for_batch(
             plan,
             sender_profile,
             effective_language,
-            product_description,
+            company_context,
             custom1_max,
             custom2_max,
         )

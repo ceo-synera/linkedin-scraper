@@ -40,6 +40,7 @@ class RunRequest(BaseModel):
     markets: List[str]
     combos: List[str]
     total_leads: int
+    company_context: str = ""
     sdr_assignments: List[SdrAssignment] = Field(default_factory=list)
     apify_token: str
     anthropic_key: str
