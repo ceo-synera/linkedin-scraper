@@ -1,12 +1,19 @@
 import asyncio
 import logging
 import sys
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.bd_job_runner import run_bd_job, run_bd_messages_job
+from api.bridge_job_runner import run_bridge_job
+from api.bridge_models import (
+    BridgeCandidateUpdate,
+    BridgeRunRequest,
+    BridgeSeedListInput,
+)
 from api.database import get_supabase
 from api.job_runner import run_job
 from api.models import BDMessageRequest, BDRunRequest, RunRequest
@@ -59,18 +66,23 @@ def _fetch_run_status(run_id: str) -> Any:
     )
 
 
-def _assert_run_belongs_to_org(run_row: Dict[str, Any], organization_id: str) -> None:
-    """Reject a run_id that belongs to a different tenant.
+def _assert_owned_by_org(
+    row: Dict[str, Any], organization_id: str, resource: str = "run"
+) -> None:
+    """Reject a resource id that belongs to a different tenant.
 
     Without this, knowing (or guessing) another org's pending run_id would let
     a caller start a pipeline under a run row they don't own — the scraped data
     itself stays correctly scoped, but that run's status/counters would be
-    driven by someone else's request.
+    driven by someone else's request. The same guard covers Bridge candidates
+    before they're mutated.
+
+    Fails closed: a row with a missing or null organization_id is rejected too.
     """
-    if run_row.get("organization_id") != organization_id:
+    if row.get("organization_id") != organization_id:
         raise HTTPException(
             status_code=403,
-            detail="This run does not belong to your organization",
+            detail=f"This {resource} does not belong to your organization",
         )
 
 
@@ -102,7 +114,7 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _assert_run_belongs_to_org(existing.data[0], run_request.organization_id)
+    _assert_owned_by_org(existing.data[0], run_request.organization_id)
 
     if existing.data[0]["status"] != "pending":
         raise HTTPException(
@@ -127,7 +139,7 @@ async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _assert_run_belongs_to_org(existing.data[0], bd_run_request.organization_id)
+    _assert_owned_by_org(existing.data[0], bd_run_request.organization_id)
 
     if existing.data[0]["status"] != "pending":
         raise HTTPException(
@@ -152,7 +164,7 @@ async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) 
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    _assert_run_belongs_to_org(existing.data[0], message_request.organization_id)
+    _assert_owned_by_org(existing.data[0], message_request.organization_id)
 
     def _on_done(task: asyncio.Task, run_id: str = run_id) -> None:
         active_tasks.pop(run_id, None)
@@ -192,3 +204,192 @@ async def cancel_run(run_id: str) -> Dict[str, str]:
     active_tasks.pop(run_id, None)
 
     return {"run_id": run_id, "status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# Bridge (partnership discovery)
+#
+# Every read and write is scoped by organization_id inside the query's WHERE
+# clause, so a resource id belonging to another tenant simply matches no row.
+# Where a resource is fetched before being mutated, ownership is asserted
+# against the row's real organization_id, never trusted from the request body.
+# ---------------------------------------------------------------------------
+
+
+def _bridge_insert_seed_list(payload: Dict[str, Any]) -> Any:
+    supabase = get_supabase()
+    return supabase.table("bridge_seed_lists").insert(payload).execute()
+
+
+def _bridge_list_seed_lists(organization_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_seed_lists")
+        .select("*")
+        .eq("organization_id", organization_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+
+def _bridge_fetch_run(run_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_runs").select("*").eq("id", run_id).limit(1).execute()
+    )
+
+
+def _bridge_fetch_run_logs(run_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_run_logs")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+
+def _bridge_list_candidates(run_id: str, organization_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_candidates")
+        .select("*")
+        .eq("run_id", run_id)
+        .eq("organization_id", organization_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+
+def _bridge_fetch_candidate(candidate_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_candidates")
+        .select("id,organization_id")
+        .eq("id", candidate_id)
+        .limit(1)
+        .execute()
+    )
+
+
+def _bridge_update_candidate_status(
+    candidate_id: str, organization_id: str, verification_status: str
+) -> Any:
+    supabase = get_supabase()
+    # organization_id stays in the WHERE clause as well as being asserted by
+    # the caller — belt and braces, so the UPDATE itself can't touch another
+    # tenant's row even if the guard above were ever bypassed.
+    return (
+        supabase.table("bridge_candidates")
+        .update(
+            {
+                "verification_status": verification_status,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", candidate_id)
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+
+@app.post("/bridge/seed-lists")
+async def create_bridge_seed_list(seed_list: BridgeSeedListInput) -> Dict[str, Any]:
+    payload = seed_list.model_dump()
+    res = await asyncio.to_thread(_bridge_insert_seed_list, payload)
+
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create seed list")
+
+    return res.data[0]
+
+
+@app.get("/bridge/seed-lists")
+async def list_bridge_seed_lists(organization_id: str) -> Dict[str, Any]:
+    res = await asyncio.to_thread(_bridge_list_seed_lists, organization_id)
+    return {"organization_id": organization_id, "seed_lists": res.data}
+
+
+@app.post("/bridge/runs")
+async def start_bridge_run(bridge_run_request: BridgeRunRequest) -> Dict[str, str]:
+    existing = await asyncio.to_thread(_bridge_fetch_run, bridge_run_request.run_id)
+
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Bridge run not found")
+
+    _assert_owned_by_org(
+        existing.data[0], bridge_run_request.organization_id
+    )
+
+    if existing.data[0]["status"] != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is not pending (current status: {existing.data[0]['status']})",
+        )
+
+    def _on_done(task: asyncio.Task, run_id: str = bridge_run_request.run_id) -> None:
+        active_tasks.pop(run_id, None)
+
+    task = asyncio.create_task(run_bridge_job(bridge_run_request))
+    task.add_done_callback(_on_done)
+    active_tasks[bridge_run_request.run_id] = task
+
+    return {"run_id": bridge_run_request.run_id, "status": "started"}
+
+
+@app.get("/bridge/runs/{run_id}")
+async def get_bridge_run(run_id: str, organization_id: str) -> Dict[str, Any]:
+    res = await asyncio.to_thread(_bridge_fetch_run, run_id)
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Bridge run not found")
+
+    _assert_owned_by_org(res.data[0], organization_id)
+
+    return res.data[0]
+
+
+@app.get("/bridge/runs/{run_id}/logs")
+async def get_bridge_run_logs(run_id: str, organization_id: str) -> Dict[str, Any]:
+    # bridge_run_logs has no organization_id of its own, so ownership is
+    # established via the parent run before any log line is returned.
+    run_res = await asyncio.to_thread(_bridge_fetch_run, run_id)
+
+    if not run_res.data:
+        raise HTTPException(status_code=404, detail="Bridge run not found")
+
+    _assert_owned_by_org(run_res.data[0], organization_id)
+
+    res = await asyncio.to_thread(_bridge_fetch_run_logs, run_id)
+    return {"run_id": run_id, "logs": res.data}
+
+
+@app.get("/bridge/candidates")
+async def list_bridge_candidates(run_id: str, organization_id: str) -> Dict[str, Any]:
+    res = await asyncio.to_thread(_bridge_list_candidates, run_id, organization_id)
+    return {"run_id": run_id, "organization_id": organization_id, "candidates": res.data}
+
+
+@app.patch("/bridge/candidates/{candidate_id}")
+async def update_bridge_candidate(
+    candidate_id: str, update: BridgeCandidateUpdate
+) -> Dict[str, Any]:
+    existing = await asyncio.to_thread(_bridge_fetch_candidate, candidate_id)
+
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    _assert_owned_by_org(existing.data[0], update.organization_id, "candidate")
+
+    res = await asyncio.to_thread(
+        _bridge_update_candidate_status,
+        candidate_id,
+        update.organization_id,
+        update.verification_status,
+    )
+
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    return res.data[0]

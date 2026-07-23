@@ -485,6 +485,122 @@ def run_company_seed_scraping(
     return all_leads
 
 
+# ---------------------------------------------------------------------------
+# Bridge (partnership discovery)
+#
+# A separate product from the lead scraper: it looks for partnership contacts
+# inside specific target companies/industries, for an admin to review by hand.
+# It shares the actor's two-flow protocol via _init_search / _paginate, but
+# deliberately not _scrape_combo — the overfetch + DB-dedup backfill there is
+# tuned for the lead pipeline and reads scraper_leads, which Bridge must never
+# touch.
+# ---------------------------------------------------------------------------
+
+# Fixed for every Bridge search — unlike the lead combos, the admin doesn't
+# configure these. They only choose which companies/industries to search in.
+BRIDGE_TITLE_KEYWORDS = [
+    "Head of Partnerships",
+    "VP Partnerships",
+    "Director of Partnerships",
+    "Partnerships Manager",
+    "Business Development Manager",
+    "Head of Business Development",
+    "Alliances Director",
+    "Alliances Manager",
+    "Channel Manager",
+    "Channel Partnerships Manager",
+    "VP Business Development",
+    "Director de Alianzas",
+    "Gerente de Alianzas",
+    "Director de Desarrollo de Negocios",
+    "夥伴關係經理",
+    "業務開發經理",
+    "策略聯盟主管",
+]
+
+# Few people hold these titles at any one company, so ask for a handful per
+# company rather than a big page.
+BRIDGE_RESULTS_PER_COMPANY = 3
+
+# When no company_names are given the search is filter-only (industry /
+# headcount / geo), so there's no per-company anchor to scale the limit from.
+# Cap it at a single page.
+BRIDGE_FILTER_ONLY_LIMIT = PAGE_SIZE
+
+
+def run_bridge_scraping(
+    apify_token: str,
+    company_names: List[str],
+    industry_codes: List[int],
+    company_headcounts: List[str],
+    geo_codes: List[int],
+    title_keywords: List[str],
+    limit: int = BRIDGE_RESULTS_PER_COMPANY,
+    log_fn: Optional[LogFn] = None,
+) -> List[Dict[str, Any]]:
+    """Find partnership contacts for a Bridge seed list.
+
+    `limit` is per company: a batch of N companies asks the actor for
+    limit * N results. Company-name mode and filter-only mode are combinable —
+    whatever the seed list has set gets sent together.
+    """
+    emit: LogFn = log_fn or log.info
+    client = ApifyClient(apify_token)
+
+    # Filters shared by every search, only included when actually set so the
+    # actor never receives empty arrays it might treat as "match nothing".
+    base_filters: Dict[str, Any] = {}
+    normalized_headcounts = _normalize_company_headcounts(company_headcounts)
+    if normalized_headcounts:
+        base_filters["company_headcounts"] = normalized_headcounts
+    if geo_codes:
+        base_filters["geo_codes"] = [int(code) for code in geo_codes]
+    if industry_codes:
+        base_filters["industry_codes"] = [int(code) for code in industry_codes]
+
+    # Company-name searches are chunked; a filter-only search runs once.
+    batches = (
+        _chunk_list(company_names, MAX_COMPANY_NAMES_PER_BATCH)
+        if company_names
+        else [[]]
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    seen_linkedin_urls = set()
+
+    for batch in batches:
+        search_limit = limit * len(batch) if batch else BRIDGE_FILTER_ONLY_LIMIT
+
+        init_input: Dict[str, Any] = {
+            "title_keywords": title_keywords,
+            "limit": search_limit,
+            **base_filters,
+        }
+        if batch:
+            init_input["current_company_names"] = batch
+
+        emit(
+            f"[bridge] searching {len(batch)} company name(s), "
+            f"limit={search_limit}"
+        )
+        emit(f"[Bridge Flow 1 init] input: {_dump(init_input)}")
+
+        request_id = _init_search(client, init_input, emit)
+        if not request_id:
+            continue
+
+        for lead in _paginate(client, request_id, search_limit, emit):
+            linkedin_url = lead.get("linkedin_url")
+            if not linkedin_url or linkedin_url in seen_linkedin_urls:
+                continue
+            seen_linkedin_urls.add(linkedin_url)
+            candidates.append(lead)
+
+        emit(f"[bridge] running total: {len(candidates)} candidate(s)")
+
+    return candidates
+
+
 def run_scraping(
     apify_token: str,
     combos: List[Dict[str, Any]],
