@@ -64,8 +64,10 @@ El CRM manda siempre **exactamente un** `SdrAssignment` (los SDRs perdieron acce
 
 El actor tiende a devolver los mismos perfiles top para un mismo set de filtros, así que corrida tras corrida el dedup los descarta y el run rinde cada vez menos. Dos compensaciones:
 
-- **`OVERFETCH_MULTIPLIER = 1.7`** — a Apify se le pide 70% más de lo solicitado, como margen contra la pérdida esperada por dedup.
+- **`OVERFETCH_MULTIPLIER = 1.2`** — a Apify se le pide 20% más de lo solicitado, como margen contra la pérdida esperada por dedup (antes 1.7×; se bajó porque un margen más grande también alarga cada ciclo de Flow 2, al traer y procesar más resultados por página).
 - **Backfill por paginación** — tras cada página, se corre un dedup preliminar contra la base; si quedó corto, se pide la página siguiente (mismo `request_id`, solo Flow 2) hasta **`MAX_COMBO_PAGES = 3`**. Ese dedup solo decide si vale la pena paginar; el `dedup_leads` final de `job_runner` sigue siendo el autoritativo.
+- **Ninguna celda entrega más de su propio target** — si tras el dedup preliminar una celda tiene más leads nuevos de los que le tocaban, se recorta a una muestra aleatoria de exactamente su target antes de sumarla al total. Sin este corte, un combo con un pool grande podía aportar de más y el run terminaba por encima de `total_leads` (visto en producción: target=46, terminó sumando 78).
+- **Chequeo de 80% con una ronda de reintento acotada** — si al terminar todas las celdas el total queda por debajo de `ceil(total_leads * 0.8)`, se identifican las celdas que se quedaron cortas *sin* que el actor haya confirmado que no hay más resultados (`exhausted=False`, es decir, pararon por tope de páginas, no por falta real de datos) y se les da un presupuesto fresco de hasta `MAX_COMBO_PAGES` páginas más — reutilizando el mismo `request_id`, sin correr Flow 1 de nuevo. Es una sola ronda, no un bucle: si después sigue por debajo del 80% se continúa igual con lo conseguido. Log de cada desenlace: `"Reached X/Y (Z%) after retry — proceeding"` o `"Run finished below 80% threshold: X of Y requested (Z%) after retry attempt"`.
 
 El target se reparte dinámicamente entre celdas — **una por combo**, sin importar cuántos países traiga `markets`: cada una recibe `ceil(faltante / celdas_restantes)`, así un combo que rinde de menos es compensado por los siguientes.
 
@@ -312,6 +314,7 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-23 | `get_sender_profile` filtraba solo por `id` → fuga cross-tenant de identidad de SDRs | Exige `organization_id` |
 | 2026-07-23 | Los endpoints no validaban que el `run_id` fuera de la org del request | `_assert_owned_by_org`, 403 y falla cerrado |
 | 2026-07-24 | Un run con N países de una región creaba N×combos celdas, escalando el tiempo con la cantidad de países | Se combinan en un solo `geo_codes`; celdas vuelven a ser solo por combo |
+| 2026-07-24 | Una celda con pool abundante aportaba más leads de los que le tocaban (target=46, sumó 78) → runs terminaban por encima de `total_leads` | Se recorta cada celda a su target exacto (muestra aleatoria); `OVERFETCH_MULTIPLIER` bajado a 1.2; chequeo de 80% con una ronda de reintento acotada |
 | 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
 
 ## Verificación

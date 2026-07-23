@@ -1,8 +1,9 @@
 import json
 import logging
 import math
+import random
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from apify_client import ApifyClient
 
@@ -60,8 +61,12 @@ MAX_PROCESSING_RETRIES = 30  # 30 * 10s = 5 minutes
 
 # Ask Apify for more than actually requested, to leave margin against
 # expected DB dedup losses (the actor tends to resurface the same top
-# profiles for a given filter set once they're already stored).
-OVERFETCH_MULTIPLIER = 1.7
+# profiles for a given filter set once they're already stored). Kept modest
+# (was 1.7): a bigger multiplier means more results per page to fetch and
+# process, which measurably lengthens every combo's Flow 2 cycle — the
+# per-cell target cap (see _trim_cell_leads) is what actually protects
+# against overshoot now, so this only needs to cover light dedup loss.
+OVERFETCH_MULTIPLIER = 1.2
 
 # Backfill cap: how many total pages (not extra pages — total, including
 # page 1) a single combo will fetch while trying to reach its requested
@@ -327,23 +332,124 @@ def _init_search(client: ApifyClient, init_input: Dict[str, Any], emit: LogFn) -
     return request_id
 
 
-def _scrape_combo(
-    client: ApifyClient,
-    combo: Dict[str, Any],
-    geo_codes: List[int],
-    leads_requested: int,
-    organization_id: str,
+def _trim_cell_leads(
+    leads: List[Dict[str, Any]],
+    cell_target: int,
     market: str,
     combo_code: Optional[str],
     emit: LogFn,
 ) -> List[Dict[str, Any]]:
-    # Overfetch: ask Apify for more than leads_requested, so there's margin
+    """Never let a cell contribute more than its own target.
+
+    Without this, a cell whose search happened to surface more new (non-dup)
+    leads than it was asked for would hand ALL of them back, and the run's
+    total could exceed total_leads (seen in practice: target=46, 78 returned
+    and kept). A random sample avoids always favoring the same
+    fetch/dedup order.
+    """
+    if len(leads) <= cell_target:
+        return leads
+    emit(
+        f"[combo] market={market!r} code={combo_code!r} got {len(leads)} new "
+        f"leads, trimming to target {cell_target} (random sample) so the run "
+        "total doesn't exceed total_leads"
+    )
+    return random.sample(leads, cell_target)
+
+
+def _paginate_with_dedup(
+    client: ApifyClient,
+    request_id: str,
+    cell_target: int,
+    organization_id: str,
+    raw_leads: List[Dict[str, Any]],
+    start_page: int,
+    max_page: int,
+    market: str,
+    combo_code: Optional[str],
+    emit: LogFn,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, bool]:
+    """Fetch pages starting at start_page, re-running the preliminary DB dedup
+    after each page, until cell_target new leads are reached, page max_page has
+    been fetched, or the actor signals no more results.
+
+    raw_leads/start_page let a later retry resume an already-initialized
+    search (same request_id) instead of starting over from page 1. max_page is
+    an absolute page number, not a count — the main pass calls this with
+    max_page=MAX_COMBO_PAGES (pages 1..3); a retry that wants its own fresh
+    budget of up to MAX_COMBO_PAGES more pages passes
+    max_page=last_page+MAX_COMBO_PAGES (e.g. pages 4..6), continuing the same
+    request_id rather than a cumulative cap that a combo which already used
+    its first budget could never satisfy.
+
+    Returns (new_leads, updated_raw_leads, last_page_fetched, exhausted).
+    exhausted=True means the actor confirmed there's nothing more to fetch (a
+    short/empty page) — retrying such a combo again would be a wasted call, no
+    matter how much page budget is left. This dedup only drives the pagination
+    decision here; job_runner's dedup_leads on the full scored batch remains
+    the authoritative check before storing.
+    """
+    raw = list(raw_leads)
+    new_leads, _ = dedup_leads(raw, organization_id) if raw else ([], 0)
+    page = start_page
+    last_page = start_page - 1
+
+    if page > max_page:
+        return new_leads, raw, last_page, False  # no budget left in this pass
+
+    while True:
+        page_leads = _fetch_page(client, request_id, page, emit)
+        if not page_leads:
+            return new_leads, raw, last_page, True  # confirmed: no more results
+
+        raw.extend(page_leads)
+        last_page = page
+        new_leads, _duplicates = dedup_leads(raw, organization_id)
+
+        if len(new_leads) >= cell_target:
+            return new_leads, raw, last_page, False  # reached target
+
+        if len(page_leads) < PAGE_SIZE:
+            return new_leads, raw, last_page, True  # last available page, confirmed
+
+        if page >= max_page:
+            emit(
+                f"[combo] market={market!r} code={combo_code!r} reached page "
+                f"limit ({max_page}), got {len(new_leads)}/{cell_target} new leads"
+            )
+            return new_leads, raw, last_page, False  # budget spent, more may exist
+
+        emit(
+            f"[combo] market={market!r} code={combo_code!r} after page {page}: "
+            f"{len(new_leads)} new leads (need {cell_target}), fetching page {page + 1}"
+        )
+        page += 1
+
+
+def _scrape_combo(
+    client: ApifyClient,
+    combo: Dict[str, Any],
+    geo_codes: List[int],
+    cell_target: int,
+    organization_id: str,
+    market: str,
+    combo_code: Optional[str],
+    emit: LogFn,
+) -> Dict[str, Any]:
+    """Run one combo's search and return a resumable session.
+
+    The session (request_id + accumulated raw leads + last page fetched) lets
+    run_scraping request more pages for this exact combo later — reusing the
+    same already-initialized search — if the run falls short of its 80%
+    threshold, without paying Flow 1's 5-10 min wait a second time.
+    """
+    # Overfetch: ask Apify for a bit more than cell_target, so there's margin
     # left once already-scraped/already-stored profiles get filtered out by
     # the DB dedup check below.
-    leads_to_fetch = int(leads_requested * OVERFETCH_MULTIPLIER)
+    leads_to_fetch = int(cell_target * OVERFETCH_MULTIPLIER)
     emit(
         f"[combo] market={market!r} code={combo_code!r} "
-        f"requested={leads_requested} fetching={leads_to_fetch}"
+        f"requested={cell_target} fetching={leads_to_fetch}"
     )
 
     # Flow 1 — init search.
@@ -363,52 +469,44 @@ def _scrape_combo(
     }
     emit(f"[Flow 1 init] input: {_dump(init_input)}")
 
+    session: Dict[str, Any] = {
+        "combo_code": combo_code,
+        "market": market,
+        "cell_target": cell_target,
+        "request_id": None,
+        "raw_leads": [],
+        "leads": [],
+        "last_page": 0,
+        "exhausted": True,
+    }
+
     # Flow 1 (_init_search) runs exactly once here, so its one-time 5-10 min
-    # wait only ever happens once per combo. Every extra page below reuses
-    # this same request_id through Flow 2 (_fetch_page) — Apify already has
-    # the results computed internally, so re-requesting a page is a matter of
-    # seconds, not a new long wait.
+    # wait only ever happens once per combo. Every extra page below (and any
+    # later retry) reuses this same request_id through Flow 2 (_fetch_page) —
+    # Apify already has the results computed internally, so re-requesting a
+    # page is a matter of seconds, not a new long wait.
     request_id = _init_search(client, init_input, emit)
     if not request_id:
-        return []
+        return session
+    session["request_id"] = request_id
 
-    # Flow 2 — fetch pages, running a preliminary DB dedup after each page to
-    # decide whether fetching another page is worth it. This dedup only
-    # drives the pagination decision here; job_runner's dedup_leads on the
-    # full scored batch remains the authoritative check before storing.
-    all_page_leads: List[Dict[str, Any]] = []
-    new_leads: List[Dict[str, Any]] = []
-    page = 1
-    while True:
-        page_leads = _fetch_page(client, request_id, page, emit)
-        if not page_leads:
-            break  # gave up waiting on "processing", or truly zero results
-
-        all_page_leads.extend(page_leads)
-        new_leads, _duplicates = dedup_leads(all_page_leads, organization_id)
-        new_count = len(new_leads)
-
-        if new_count >= leads_requested:
-            break  # dedup already left us with enough new leads
-
-        if len(page_leads) < PAGE_SIZE:
-            break  # actor signaled this was the last available page
-
-        if page >= MAX_COMBO_PAGES:
-            emit(
-                f"[combo] market={market!r} code={combo_code!r} reached max "
-                f"pages ({MAX_COMBO_PAGES}), got {new_count}/{leads_requested} "
-                "new leads"
-            )
-            break
-
-        emit(
-            f"[combo] market={market!r} code={combo_code!r} after page {page}: "
-            f"{new_count} new leads (need {leads_requested}), fetching page {page + 1}"
-        )
-        page += 1
-
-    return new_leads
+    new_leads, raw, last_page, exhausted = _paginate_with_dedup(
+        client,
+        request_id,
+        cell_target,
+        organization_id,
+        [],
+        1,
+        MAX_COMBO_PAGES,
+        market,
+        combo_code,
+        emit,
+    )
+    session["raw_leads"] = raw
+    session["last_page"] = last_page
+    session["exhausted"] = exhausted
+    session["leads"] = _trim_cell_leads(new_leads, cell_target, market, combo_code, emit)
+    return session
 
 
 # Company-name batching, shared by Bridge's run_bridge_scraping: the actor
@@ -642,12 +740,35 @@ def run_scraping(
 
     cells = list(combos or [{}])
     remaining = total_leads
+    cell_sessions: List[Dict[str, Any]] = []
 
     # Fixed for the whole run — the original fair share if every cell had
     # performed equally, not recomputed against cells_left like cell_target is.
     fair_share_cap = math.ceil(
         (total_leads / len(cells)) * MAX_CELL_TARGET_MULTIPLIER
     )
+
+    def _absorb(leads: List[Dict[str, Any]], market: str, combo_code: Optional[str]) -> int:
+        # Shared by the main pass and the retry pass below: only genuinely new
+        # (not-yet-seen) leads count, and the run-wide total_leads cap is
+        # enforced here too as a last line of defense (cell targets are sized
+        # to sum to at most total_leads, so this shouldn't normally trigger).
+        added = 0
+        for lead in leads:
+            if not isinstance(lead, dict):
+                continue
+            if len(all_leads) >= total_leads:
+                break
+            linkedin_url = lead.get("linkedin_url")
+            if not linkedin_url or linkedin_url in seen_linkedin_urls:
+                continue
+            seen_linkedin_urls.add(linkedin_url)
+            lead["market"] = market
+            lead["language_market"] = language_market
+            lead["combo"] = combo_code
+            all_leads.append(lead)
+            added += 1
+        return added
 
     for index, combo in enumerate(cells):
         if remaining <= 0:
@@ -669,7 +790,7 @@ def run_scraping(
             f"[combo] market={market_label!r} code={combo_code!r} "
             f"target={cell_target} remaining={remaining}"
         )
-        combo_leads = _scrape_combo(
+        session = _scrape_combo(
             client,
             combo,
             combined_geo_codes,
@@ -679,29 +800,80 @@ def run_scraping(
             combo_code,
             emit,
         )
+        cell_sessions.append(session)
 
-        added = 0
-        for lead in combo_leads:
-            if not isinstance(lead, dict):
-                continue
-
-            # Real profiles always carry a linkedin_url; skip anything without
-            # one and dedup within this run.
-            linkedin_url = lead.get("linkedin_url")
-            if not linkedin_url or linkedin_url in seen_linkedin_urls:
-                continue
-            seen_linkedin_urls.add(linkedin_url)
-
-            lead["market"] = market_label
-            lead["language_market"] = language_market
-            lead["combo"] = combo_code
-            all_leads.append(lead)
-            added += 1
-
+        added = _absorb(session["leads"], market_label, combo_code)
         remaining -= added
         emit(
             f"[combo] market={market_label!r} code={combo_code!r} "
             f"added={added} remaining={remaining}"
         )
+
+    # If the run fell short, spend one bounded extra round fetching more pages
+    # for the combos furthest from their own target — reusing each one's
+    # already-initialized search (same request_id), never re-running Flow 1.
+    threshold_80 = math.ceil(total_leads * 0.8)
+    total_so_far = len(all_leads)
+
+    if total_so_far < threshold_80:
+        emit(
+            f"[retry] {total_so_far}/{total_leads} leads is below the 80% "
+            f"threshold ({threshold_80}); requesting additional pages for the "
+            "combo(s) furthest from their target"
+        )
+
+        # Skip combos the actor already confirmed have nothing more (a
+        # short/empty page) — only ones that stopped because they hit their
+        # page budget (there might be more) are worth another request.
+        retryable = [
+            s
+            for s in cell_sessions
+            if s["request_id"] and not s["exhausted"] and len(s["leads"]) < s["cell_target"]
+        ]
+        retryable.sort(key=lambda s: s["cell_target"] - len(s["leads"]), reverse=True)
+
+        for session in retryable:
+            if len(all_leads) >= total_leads:
+                break
+
+            # Fresh budget of up to MAX_COMBO_PAGES more pages for this retry,
+            # continuing the same request_id from where the main pass left off
+            # — not a cumulative total, since a combo that already used its
+            # first budget in the main pass is precisely the case worth
+            # retrying here.
+            new_leads, raw, last_page, exhausted = _paginate_with_dedup(
+                client,
+                session["request_id"],
+                session["cell_target"],
+                organization_id,
+                session["raw_leads"],
+                session["last_page"] + 1,
+                session["last_page"] + MAX_COMBO_PAGES,
+                session["market"],
+                session["combo_code"],
+                emit,
+            )
+            session["raw_leads"] = raw
+            session["last_page"] = last_page
+            session["exhausted"] = exhausted
+            session["leads"] = _trim_cell_leads(
+                new_leads, session["cell_target"], session["market"], session["combo_code"], emit
+            )
+
+            added = _absorb(session["leads"], session["market"], session["combo_code"])
+            emit(
+                f"[retry] market={session['market']!r} code={session['combo_code']!r} "
+                f"added {added} more lead(s); running total {len(all_leads)}/{total_leads}"
+            )
+
+        total_so_far = len(all_leads)
+        percent = round(total_so_far / total_leads * 100)
+        if total_so_far >= threshold_80:
+            emit(f"Reached {total_so_far}/{total_leads} ({percent}%) after retry — proceeding")
+        else:
+            emit(
+                f"Run finished below 80% threshold: {total_so_far} of {total_leads} "
+                f"requested ({percent}%) after retry attempt"
+            )
 
     return all_leads
