@@ -7,12 +7,28 @@ __all__ = [
     "get_combo_definitions",
     "get_market_geo_code",
     "get_market_language",
+    "get_market_languages",
     "get_sender_profile",
     "list_markets",
     "list_organization_markets",
+    "region_label",
+    "resolve_markets",
 ]
 
 DEFAULT_MARKET_LANGUAGE = "en"
+
+# Pretty display text for the region slugs the markets table's CHECK
+# constraint allows ('asia', 'latin_america', 'europe', 'usa').
+REGION_LABELS = {
+    "asia": "Asia",
+    "latin_america": "Latin America",
+    "europe": "Europe",
+    "usa": "USA",
+}
+
+
+def region_label(region_slug: str) -> str:
+    return REGION_LABELS.get(region_slug, region_slug)
 
 
 class MarketNotFoundError(Exception):
@@ -21,6 +37,17 @@ class MarketNotFoundError(Exception):
     Raised instead of quietly returning no geo filter — a silent empty
     geo_codes is what produced the "Spain in LATAM" bug, where runs scraped
     the whole world and nobody noticed until the leads looked wrong.
+    """
+
+
+class MixedRegionMarketsError(Exception):
+    """Markets requested together that don't all belong to the same region.
+
+    A single search combines every requested market's geo_codes into one
+    Apify input, so they can only be labeled and reasoned about as one group
+    (e.g. "Latin America") if they actually share a region. Mixing regions
+    silently would produce a misleading market label with no way to tell
+    which countries a lead actually came from.
     """
 
 
@@ -90,6 +117,35 @@ def get_market_languages(market_names: List[str]) -> Dict[str, str]:
             (market_name or "").lower(), DEFAULT_MARKET_LANGUAGE
         )
     return languages
+
+
+def resolve_markets(market_names: List[str]) -> List[Dict[str, Any]]:
+    """Resolve geo_code/region/default_language for several markets in one query.
+
+    Case-insensitive, like the single-market lookups. Raises MarketNotFoundError
+    with the exact unresolved name — same failure mode as get_market_geo_code,
+    just batched so combining several countries into one search doesn't cost a
+    round trip per country.
+    """
+    if not market_names:
+        return []
+
+    supabase = get_supabase()
+    res = (
+        supabase.table("markets")
+        .select("name, geo_code, region, default_language")
+        .eq("is_active", True)
+        .execute()
+    )
+    by_lower = {row["name"].lower(): row for row in res.data}
+
+    resolved = []
+    for name in market_names:
+        row = by_lower.get((name or "").lower())
+        if row is None:
+            raise MarketNotFoundError(f"Market '{name}' not found in markets table")
+        resolved.append(row)
+    return resolved
 
 
 def list_markets() -> List[Dict[str, Any]]:

@@ -67,7 +67,15 @@ El actor tiende a devolver los mismos perfiles top para un mismo set de filtros,
 - **`OVERFETCH_MULTIPLIER = 1.7`** — a Apify se le pide 70% más de lo solicitado, como margen contra la pérdida esperada por dedup.
 - **Backfill por paginación** — tras cada página, se corre un dedup preliminar contra la base; si quedó corto, se pide la página siguiente (mismo `request_id`, solo Flow 2) hasta **`MAX_COMBO_PAGES = 3`**. Ese dedup solo decide si vale la pena paginar; el `dedup_leads` final de `job_runner` sigue siendo el autoritativo.
 
-El target se reparte dinámicamente entre celdas `(mercado × combo)`: cada una recibe `ceil(faltante / celdas_restantes)`, así un combo que rinde de menos es compensado por los siguientes.
+El target se reparte dinámicamente entre celdas — **una por combo**, sin importar cuántos países traiga `markets`: cada una recibe `ceil(faltante / celdas_restantes)`, así un combo que rinde de menos es compensado por los siguientes.
+
+### Varios países de una misma región en un solo `markets`
+
+El CRM puede mandar varios países de la misma región (ej. `markets: ["Argentina", "Chile", "Colombia"]`). Se combinan en **un solo `geo_codes`** para cada combo — el actor acepta varios geo codes en un mismo input — en vez de crear una celda por país, así que **5 países no tardan más que 1**: las celdas siguen siendo solo por combo. Reglas:
+
+- **Todos los países de un run deben compartir región.** Mezclar regiones (`["Argentina", "Taiwan"]`) lanza `MixedRegionMarketsError` antes de gastar ninguna llamada a Apify.
+- El actor no dice de qué país vino cada lead. Con 1 país, `lead["market"]` guarda ese país tal cual. Con varios, guarda el **nombre de la región** (`"Latin America"`).
+- El idioma de los mensajes usa un campo aparte (`language_market`), tomado del **primer país de la lista** — necesario porque el idioma se busca por nombre de país real, y `"Latin America"` no matchearía nada. Es una elección documentada, no una garantía: si la región mezcla idiomas, los leads de los demás países pueden salir en el idioma equivocado.
 
 ### `prospects` lo inserta el CRM, no este backend
 
@@ -303,6 +311,7 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-23 | Trabajo bloqueante congelaba el event loop → 504 y runs serializados | Todo en `asyncio.to_thread` |
 | 2026-07-23 | `get_sender_profile` filtraba solo por `id` → fuga cross-tenant de identidad de SDRs | Exige `organization_id` |
 | 2026-07-23 | Los endpoints no validaban que el `run_id` fuera de la org del request | `_assert_owned_by_org`, 403 y falla cerrado |
+| 2026-07-24 | Un run con N países de una región creaba N×combos celdas, escalando el tiempo con la cantidad de países | Se combinan en un solo `geo_codes`; celdas vuelven a ser solo por combo |
 | 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
 
 ## Verificación

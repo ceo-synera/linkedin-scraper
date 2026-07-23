@@ -107,10 +107,38 @@ values`, revisar si conviene agregar ese alias en vez de perder el filtro.
   `markets` (`name`, `geo_code`, `region`, `default_language`, `is_active`) y se
   resuelven con `get_market_geo_code(name)`, con match **case-insensitive**
   (`ilike`).
-- **Un mercado = un país = un geo code.** El viejo meta-mercado `"latam"`, que
-  agrupaba 6 países en una entrada, ya no existe: ahora la org elige México,
-  Brasil, Argentina… por separado. Eso también elimina de raíz el bug de
-  "España en LATAM".
+- **Un mercado = un país = un geo code**, individualmente configurable. El
+  viejo meta-mercado `"latam"`, que agrupaba 6 países en una sola entrada de
+  código, ya no existe: cada país es su propia fila en `markets`. Eso también
+  elimina de raíz el bug de "España en LATAM".
+- **El CRM puede mandar varios países de la misma región en `markets`**
+  (ej. `["Argentina", "Chile", "Colombia"]`). `run_scraping` los resuelve todos
+  con `resolve_markets()` (una sola query) y combina sus `geo_code` en **un
+  único array**, en vez de crear una celda por país — el actor acepta varios
+  `geo_codes` en un mismo input, así que 5 países cuestan lo mismo que 1: las
+  celdas siguen siendo **solo por combo**. Antes de esto se consideró (y se
+  descartó) crear celdas país×combo — hubiera multiplicado el tiempo del run
+  por la cantidad de países, cada uno con su propia espera de Flow 1 y
+  paginación de Flow 2.
+- **Todos los mercados de un run deben ser de la misma región** (`region` en
+  la tabla). Mezclar regiones (ej. `["Argentina", "Taiwan"]`) lanza
+  `MixedRegionMarketsError` antes de gastar ninguna llamada a Apify — no hay
+  forma de rotular ni razonar sobre un grupo así como un solo mercado.
+- **El actor no dice de qué país vino cada lead** (solo `location` en texto
+  libre). Con 1 mercado, `lead["market"]` guarda ese país exacto, sin cambios.
+  Con varios países combinados, se guarda el **nombre de la región**
+  (`"Latin America"`, vía `region_label()`) — adivinar el país por
+  `location` no se implementó, no vale el riesgo de acertar mal.
+- **El idioma de los mensajes usa un campo aparte, `lead["language_market"]`**,
+  no `lead["market"]`. Es necesario: `market_languages` (en
+  `message_generator.py`) está indexado por nombre de país real, y buscar por
+  `"Latin America"` ahí no matchea nada — sin este campo, **todo run
+  multi-país caería en silencio a inglés**. Con varios países se usa el
+  idioma del **primero de la lista** como proxy — una elección deliberada y
+  documentada, no una garantía: si la región mezcla idiomas (ej. combinar
+  varios países de Asia con scripts distintos), los leads de los países que no
+  son el primero pueden recibir el mensaje en el idioma equivocado. Con un
+  único mercado, sigue resolviendo por su propio nombre exacto, sin cambios.
 - **Un mercado desconocido corta el run** con `MarketNotFoundError: Market 'X'
   not found in markets table`, resuelto **antes** de gastar llamadas a Apify. El
   comportamiento anterior era devolver `geo_codes: []` = sin filtro geográfico,

@@ -18,7 +18,12 @@ except ImportError:  # pragma: no cover - defensive against client layout change
 # only informs the pagination decision; job_runner's final dedup_leads call
 # on the full scored batch remains the authoritative one that determines
 # what's actually stored.
-from api.config_generator import MarketNotFoundError, get_market_geo_code
+from api.config_generator import (
+    MarketNotFoundError,
+    MixedRegionMarketsError,
+    region_label,
+    resolve_markets,
+)
 from api.dedup import dedup_leads
 
 log = logging.getLogger(__name__)
@@ -325,7 +330,7 @@ def _init_search(client: ApifyClient, init_input: Dict[str, Any], emit: LogFn) -
 def _scrape_combo(
     client: ApifyClient,
     combo: Dict[str, Any],
-    geo_codes: List[str],
+    geo_codes: List[int],
     leads_requested: int,
     organization_id: str,
     market: str,
@@ -588,27 +593,54 @@ def run_scraping(
     if not markets:
         return all_leads
 
-    # Flatten (market, combo) into cells and give each a dynamic target of the
-    # remaining shortfall spread over the cells still to come. A combo that
-    # returns fewer real matches than its share (now measured post-DB-dedup,
-    # see _scrape_combo's overfetch + pagination backfill) leaves `remaining`
-    # high, so later cells automatically pick up the slack — instead of the
-    # old fixed per-combo cap that could never recover an under-delivering
-    # combo. Only leads actually added (after this run's own dedup, on top of
-    # the DB dedup _scrape_combo already applied) count toward the target.
-    # Resolve every market's geo code up front, so an unknown market fails the
+    # Resolve every requested market up front, so an unknown market fails the
     # run immediately with a clear message — before spending a single Apify
     # call — instead of silently scraping with no geo filter, which is exactly
     # how the "Spain in LATAM" bug went unnoticed.
-    geo_code_by_market: Dict[str, int] = {}
-    for market in markets:
-        geo_code = get_market_geo_code(market)
-        if geo_code is None:
-            raise MarketNotFoundError(f"Market '{market}' not found in markets table")
-        geo_code_by_market[market] = geo_code
-        emit(f"[market] {market!r} -> geo_code={geo_code}")
+    resolved_markets = resolve_markets(markets)
 
-    cells = [(market, combo) for market in markets for combo in (combos or [{}])]
+    # Countries within one region are combined into a single geo_codes array —
+    # the actor accepts multiple geo_codes in one input, so ["Argentina",
+    # "Chile", "Colombia"] becomes one search per combo covering all three, not
+    # three separate cells. Cells stay one-per-combo regardless of how many
+    # countries are selected, so a 5-country run takes no longer than a
+    # 1-country run.
+    regions = {row["region"] for row in resolved_markets}
+    if len(regions) > 1:
+        raise MixedRegionMarketsError(
+            f"Markets {markets!r} span multiple regions ({sorted(regions)}); "
+            "a single run's markets must all belong to one region."
+        )
+
+    combined_geo_codes = sorted({int(row["geo_code"]) for row in resolved_markets})
+
+    # The actor doesn't return which specific country a lead came from (only
+    # a free-text location), so a lead can't be labeled with its real country
+    # once several are combined. With one market there's no ambiguity, so keep
+    # storing that market's own name exactly as before. With several, store
+    # the region's display name instead of guessing.
+    if len(resolved_markets) == 1:
+        market_label = markets[0]
+        language_market = markets[0]
+    else:
+        market_label = region_label(resolved_markets[0]["region"])
+        # Language can't be resolved per lead either. Using the first-listed
+        # market's language is a deliberate, documented choice, not a
+        # guarantee: if the selected countries don't share a language (e.g.
+        # combining Asian markets with different scripts), messages for
+        # leads actually from the other countries may come out in the wrong
+        # language. This only affects multi-country runs.
+        language_market = markets[0]
+        emit(
+            f"[market] combined {markets!r} into region {market_label!r}, "
+            f"geo_codes={combined_geo_codes} "
+            f"(message language will follow {language_market!r})"
+        )
+
+    for row in resolved_markets:
+        emit(f"[market] {row['name']!r} -> geo_code={row['geo_code']}")
+
+    cells = list(combos or [{}])
     remaining = total_leads
 
     # Fixed for the whole run — the original fair share if every cell had
@@ -617,29 +649,35 @@ def run_scraping(
         (total_leads / len(cells)) * MAX_CELL_TARGET_MULTIPLIER
     )
 
-    for index, (market, combo) in enumerate(cells):
+    for index, combo in enumerate(cells):
         if remaining <= 0:
             break
 
         cells_left = len(cells) - index
         cell_target = max(-(-remaining // cells_left), 1)  # ceil division
-        geo_codes = [geo_code_by_market[market]]
         combo_code = combo.get("code") if isinstance(combo, dict) else None
 
         if cell_target > fair_share_cap:
             emit(
-                f"[combo] market={market!r} code={combo_code!r} target capped at "
-                f"{fair_share_cap} (fair share ceiling), some leads may fall "
+                f"[combo] market={market_label!r} code={combo_code!r} target capped "
+                f"at {fair_share_cap} (fair share ceiling), some leads may fall "
                 "short of total_leads requested"
             )
             cell_target = fair_share_cap
 
         emit(
-            f"[combo] market={market!r} code={combo_code!r} "
+            f"[combo] market={market_label!r} code={combo_code!r} "
             f"target={cell_target} remaining={remaining}"
         )
         combo_leads = _scrape_combo(
-            client, combo, geo_codes, cell_target, organization_id, market, combo_code, emit
+            client,
+            combo,
+            combined_geo_codes,
+            cell_target,
+            organization_id,
+            market_label,
+            combo_code,
+            emit,
         )
 
         added = 0
@@ -654,12 +692,16 @@ def run_scraping(
                 continue
             seen_linkedin_urls.add(linkedin_url)
 
-            lead["market"] = market
+            lead["market"] = market_label
+            lead["language_market"] = language_market
             lead["combo"] = combo_code
             all_leads.append(lead)
             added += 1
 
         remaining -= added
-        emit(f"[combo] market={market!r} code={combo_code!r} added={added} remaining={remaining}")
+        emit(
+            f"[combo] market={market_label!r} code={combo_code!r} "
+            f"added={added} remaining={remaining}"
+        )
 
     return all_leads

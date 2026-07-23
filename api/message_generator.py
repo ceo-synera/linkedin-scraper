@@ -261,9 +261,12 @@ async def generate_messages_for_batch(
     custom1_max, custom2_max = _resolve_char_limits(sender_profile)
 
     def build_prompt(lead: Dict[str, Any]) -> str:
-        # Resolve language per lead: a batch can span markets when an SDR
-        # covers several. Fall back to the batch-level market parameter.
-        lead_market = lead.get("market") or market
+        # Resolve language per lead. `language_market` (set when several
+        # countries were combined into one region search) takes priority over
+        # `market`, which may hold a region display name like "Latin America"
+        # that market_languages — keyed by real country names — wouldn't
+        # match. Falls back to the batch-level market parameter.
+        lead_market = lead.get("language_market") or lead.get("market") or market
         effective_language = _resolve_language(
             language, lead_market, sender_profile, market_languages
         )
