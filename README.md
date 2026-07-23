@@ -2,219 +2,279 @@
 
 Backend FastAPI multi-tenant para el producto **LinkedIn CRM & Outreach Platform** de Insight Software. Corre en Railway y se conecta al CRM vía Supabase.
 
-## Arquitectura
+Aloja **dos productos independientes**:
 
-- **api/** — aplicación FastAPI: endpoints, orquestación del pipeline, generación de mensajes, dedup y distribución de leads.
-- **scraper/** — scraping de LinkedIn Sales Navigator vía Apify y scoring ICP.
+| Producto | Qué hace | Pipeline |
+|---|---|---|
+| **Leads** | Busca personas por título/geo para venta directa, las puntúa, y genera mensajes de outreach | `api/job_runner.py` |
+| **Bridge** | Busca contactos de partnerships B2B dentro de empresas objetivo, para que un admin los revise a mano | `api/bridge_job_runner.py` |
+
+No comparten tablas ni dedup. Un lead de venta y un contacto de partnership son cosas distintas, y mezclarlos contaminaría el dedup de ambos.
+
+## Arquitectura
 
 ```
 api/
-  main.py              # FastAPI app y endpoints
-  models.py            # Modelos Pydantic (RunRequest, BDRunRequest, BDMessageRequest, SenderProfile, SdrAssignment)
-  database.py          # Cliente Supabase, logging y actualización de estado de runs
-  job_runner.py        # Pipeline del run de leads individuales
-  bd_job_runner.py      # Pipeline del run de BD Group (scraping + mensajería bajo demanda)
-  config_generator.py  # Combos, seed lists de BD Group, ICP keywords, channel hooks, product_description y sender profiles desde Supabase
-  message_generator.py # Generación de mensajes con Claude (o proveedor custom): modo individual y modo BD Group
-  dedup.py             # Dedup contra Supabase
-  lead_distributor.py  # Distribución de leads entre SDRs (solo pipeline individual)
+  main.py                # FastAPI app y endpoints (Leads + Bridge)
+  models.py              # Modelos Pydantic de Leads (RunRequest, SenderProfile, SdrAssignment)
+  bridge_models.py       # Modelos Pydantic de Bridge
+  database.py            # Cliente Supabase, log_run y update_run_status (tablas runs/run_logs)
+  job_runner.py          # Pipeline de Leads
+  bridge_job_runner.py   # Pipeline de Bridge (estado/logs/dedup propios)
+  config_generator.py    # Combos y sender profiles desde Supabase
+  message_generator.py   # Generación de mensajes con Claude (paralela, con semáforo)
+  dedup.py               # Dedup de Leads contra scraper_leads + prospects
+  lead_distributor.py    # Asignación de leads al SDR del run
 scraper/
-  apify_scraper.py     # Scraping vía Apify (sales-navigator-scraper-by-filters): combos título/geo y BD Group por empresa
-  icp_scorer.py         # Scoring ICP de leads
+  apify_scraper.py       # Actor de Apify: protocolo de 2 flows, combos de Leads y búsqueda de Bridge
+  icp_scorer.py          # Scoring ICP (keywords hardcodeadas)
 requirements.txt
 Procfile
 ```
 
 ## Principios de diseño
 
-- **Sin cuentas hardcodeadas**: toda la configuración (combos, sender profiles, asignaciones) viene de Supabase o del request.
-- **Sin config estática**: los combos de scraping se resuelven dinámicamente por run desde `scraper_combos_master` y `org_combos`.
-- **Sin Asana**: el dedup se hace contra `scraper_leads` y `prospects` en Supabase.
-- **Concurrencia**: cada run usa su propio directorio temporal `/tmp/run_{run_id}/`, que se limpia al terminar (éxito o error).
-- **Multi-tenant**: `organization_id` está presente en todas las operaciones.
-- **Sin secretos persistidos**: las API keys de Apify y Claude/AITokenKing viajan en cada request desde el CRM y nunca se guardan en el servidor.
-- **BD Group es un pipeline separado**: la búsqueda por empresa objetivo (`api/bd_job_runner.py`) no es un modo del pipeline de leads individuales — tiene su propio endpoint, su propio modelo de request y no reutiliza scoring, distribución ni mensajería. Un run BD Group pertenece a un único SDR (`owner_sdr_id`), no se reparte entre varios.
+- **Sin secretos persistidos**: las API keys de Apify y Claude/AITokenKing viajan en cada request desde el CRM y nunca se guardan en el servidor. Solo hay 2 env vars.
+- **Sin config estática**: los combos se resuelven por run desde `scraper_combos_master` + `org_combos`.
+- **Multi-tenant estricto**: `organization_id` va en el `WHERE` de cada query, no como chequeo posterior. Ver [Aislamiento multi-tenant](#aislamiento-multi-tenant).
+- **El backend nunca crea tablas ni columnas** — solo lee/escribe sobre el esquema que ya existe en el Supabase del CRM.
+- **Nada bloqueante en el event loop**: todo el trabajo síncrono (Supabase, Apify) va en `asyncio.to_thread`. Ver [Concurrencia](#concurrencia-y-el-event-loop).
+- **Concurrencia por run**: cada run de Leads usa su propio `/tmp/run_{run_id}/`, que se limpia al terminar (éxito o error).
 
-## Pipeline de un run (`api/job_runner.py`)
+## Pipeline de Leads (`api/job_runner.py`)
 
 1. `update_run_status` → `running`
 2. `get_combo_definitions` desde Supabase
-3. `run_scraping` — un run de Apify por mercado
+3. `run_scraping` — Apify, con sobre-pedido y paginación (ver abajo)
 4. `score_leads` — scoring ICP
-5. `dedup_leads` — dedup contra Supabase
-6. `distribute_leads` — distribución entre SDRs respetando mercados asignados
-7. Por cada SDR: `generate_messages_for_batch` (con perfil completo si el plan es Premium+)
-8. `import_leads_to_supabase` — inserta en `scraper_leads` y en `prospects` (`assigned_to`, `outreach_status='new'`)
-9. Actualiza `run_sdr_assignments` y `monthly_lead_counts`
-10. `update_run_status` → `completed`, con `total_leads` (ya no se derivan `hot_count`/`warm_count`/`cold_count` — no hay clasificación automática)
+5. `dedup_leads` — contra `scraper_leads` + `prospects`
+6. `distribute_leads` — asigna al SDR del run
+7. `generate_messages_for_batch` — mensajes en paralelo (semáforo de 6)
+8. `import_leads_to_supabase` — inserta en **`scraper_leads` únicamente**
+9. Bookkeeping best-effort: `run_sdr_assignments` y `monthly_lead_counts`
+10. `update_run_status` → `completed` con `total_leads`
 
-Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `failed` con `error_message`.
+Si algo falla, se registra en `run_logs` y el run pasa a `failed` con `error_message`.
+
+### Un solo SDR por run
+
+El CRM manda siempre **exactamente un** `SdrAssignment` (los SDRs perdieron acceso al Scraper; solo el admin corre runs). Con un único destinatario garantizado, `distribute_leads` le asigna el **100% de los leads sin filtrar por mercado** — el ruteo por mercado solo generaba riesgo de leads huérfanos por mismatch de mayúsculas o un `assigned_markets` incompleto. La lógica de reparto por mercado sigue presente como fallback por si alguna vez se vuelven a mandar varios.
+
+### Sobre-pedido y paginación contra el dedup
+
+El actor tiende a devolver los mismos perfiles top para un mismo set de filtros, así que corrida tras corrida el dedup los descarta y el run rinde cada vez menos. Dos compensaciones:
+
+- **`OVERFETCH_MULTIPLIER = 1.7`** — a Apify se le pide 70% más de lo solicitado, como margen contra la pérdida esperada por dedup.
+- **Backfill por paginación** — tras cada página, se corre un dedup preliminar contra la base; si quedó corto, se pide la página siguiente (mismo `request_id`, solo Flow 2) hasta **`MAX_COMBO_PAGES = 3`**. Ese dedup solo decide si vale la pena paginar; el `dedup_leads` final de `job_runner` sigue siendo el autoritativo.
+
+El target se reparte dinámicamente entre celdas `(mercado × combo)`: cada una recibe `ceil(faltante / celdas_restantes)`, así un combo que rinde de menos es compensado por los siguientes.
+
+### `prospects` lo inserta el CRM, no este backend
+
+El run escribe **solo** en `scraper_leads`. `prospects` tiene campos que son dominio del CRM —sobre todo `area_id` (uuid **NOT NULL**)— que el scraper no tiene de dónde sacar. El CRM hace ese insert después, con su contexto de área/asignación.
 
 ## Scoring ICP (`scraper/icp_scorer.py`)
 
-Las keywords de scoring ya no están hardcodeadas: se leen por organización desde la tabla
-`org_icp_keywords` (`organization_id`, `category`, `keyword`, `weight`) vía
-`api/config_generator.get_icp_keywords`, siguiendo el mismo patrón que `get_combo_definitions`.
-Esto permite que cada organización cliente configure su propio ICP sin tocar código.
+Las keywords están **hardcodeadas** en el módulo. Hubo una versión que las leía por organización desde `org_icp_keywords`, pero se revirtió: esa tabla no existía en Supabase y el loader no toleraba su ausencia, así que todo run fallaba con `PGRST205`. Además, con la tabla vacía todo lead puntuaba ≤30 y salía COLD.
 
-| Dimensión | Cómo se calcula |
-|---|---|
-| Job title | Se compara el `job_title` del lead contra las keywords de categoría `decision_title`; si hay match, se usa el peso (`weight`) más alto. Si no hay match, se repite contra `influencer_title` (tier más bajo). Sin match en ninguna categoría (o categoría sin configurar) → 0. |
-| Company size | Fijo, 15 puntos — el actor de Apify ya filtra por `company_headcounts` en el input. |
-| Industry | Se compara el bio/`about` del lead contra las keywords de categoría `industry`; se usa el mejor match (peso más alto), no una suma. Sin match o sin configurar → 0. |
-| Actividad en LinkedIn | Fijo, 15 puntos — el actor ya filtra por `posted_on_linkedin=true` en el input. |
-| Señal de compra (categoría `ai_signal` en la tabla, pero es una dimensión genérica de "señal", no específica de IA) | Se suma el peso de cada keyword distinta de esa categoría que aparezca en el bio/`about` — varios matches suman más que uno solo. Sin match o sin configurar → 0. |
+| Dimensión | Máx | Cómo se calcula |
+|---|---|---|
+| Job title | 30 | `job_title` contra `PRIORITY_TITLES` |
+| Company size | 15 | Fijo — el actor ya filtra por `company_headcounts` |
+| Industry | 10 | Baseline fijo — el actor no devuelve industria |
+| Actividad en LinkedIn | 15 | Fijo — el actor ya filtra por `posted_on_linkedin` |
+| Señal de compra | 20 | Keywords de `AI_SIGNAL_KEYWORDS` en el `about` |
 
-El total se clampea entre 0 y 100, igual que antes.
+Clasificación: **HOT ≥ 70 / WARM 50-69 / COLD < 50**.
 
-No hay clasificación automática HOT/WARM/COLD: `icp_score` se calcula y se guarda igual que antes,
-pero la temperatura del lead (`temperature` en `scraper_leads`/`prospects`) ya no se autoasigna —
-queda en blanco al insertar, para que un SDR la determine más adelante en base a outreach real.
+`icp_tier` se calcula y se loguea (`"Scored: 12 HOT, 20 WARM, 13 COLD"`), pero **no se persiste**: la columna `temperature` de `scraper_leads` no se escribe. La temperatura real es un juicio del SDR después del outreach, no algo que se derive al scrapear.
 
-## Pipeline de un run BD Group (`api/bd_job_runner.py`)
+> Si alguna vez se quiere ICP configurable por organización, la forma correcta es **híbrida**: estos defaults hardcodeados como base, y la tabla por org como *override* opcional. Así una org nueva funciona out-of-the-box y nada se rompe si la tabla no existe.
 
-BD Group busca por empresas objetivo (`current_company_names`) en vez de por título/geo. Es un
-pipeline completamente separado del de leads individuales: setup propio, endpoint propio, y no
-reutiliza scoring, distribución entre SDRs ni generación de mensajes (ambas son fases
-posteriores). Un run pertenece a un único SDR (`owner_sdr_id`).
+## Bridge (`api/bridge_job_runner.py`)
 
-1. `update_run_status` → `running`
-2. `get_company_seed_lists` desde Supabase (`org_company_seed_lists`, filtradas por
-   `seed_list_ids` del request)
-3. `run_company_seed_scraping` — un run de Apify por seed list, en batches (el actor acepta
-   máx. 10 `current_company_names` y máx. 20 `title_keywords` por batch; si una seed list tiene
-   más, se parte en varios batches y se agregan los resultados)
-4. `dedup_leads` — mismo dedup contra `scraper_leads`/`prospects` que usa el pipeline individual
-5. `import_bd_candidates_to_supabase` — inserta en `scraper_leads` con `lead_type =
-   'bd_channel_contact'`, `seed_company_name` (la empresa que el actor realmente devolvió para
-   ese lead, no el input de búsqueda), `verification_status = 'pending'`, `search_combo` (nombre
-   de la seed list) y `market` (de la seed list). Sin `icp_score`, sin score de canal, sin
-   mensaje de outreach — son fases posteriores.
-6. Bookkeeping best-effort: upsert en `run_sdr_assignments` con `owner_sdr_id` y el total de
-   candidatos guardados (mismo mecanismo que usa el pipeline individual para trackear SDR↔run,
-   no una columna nueva en `scraper_leads`)
-7. `update_run_status` → `completed`, con `total_leads`
+Bridge busca contactos de partnerships dentro de empresas/industrias objetivo. **No genera mensajes de outreach** — solo descubre y organiza candidatos para revisión humana. Reemplaza por completo al viejo "BD Group", que fue eliminado.
 
-Si cualquier paso falla, se registra el error en `run_logs` y el run pasa a `failed` con
-`error_message`, igual que el pipeline individual.
+1. `update_bridge_run_status` → `running`
+2. `get_bridge_seed_list` — la seed list, filtrada por `organization_id` **y** `id`
+3. `run_bridge_scraping` — Apify con los filtros de la seed list
+4. `dedup_bridge_candidates` — **exclusivamente contra `bridge_candidates`**
+5. `import_bridge_candidates` — inserta con `verification_status='pending'`
+6. `update_bridge_run_status` → `completed` con `total_candidates`
 
-**Mensajería BD Group no se genera durante el scraping.** Los candidatos quedan sin `custom1`/
-`custom2` hasta que un humano confirma que el candidato es real (`verification_status` deja de
-ser `'pending'`) — generar un mensaje pagado con Claude para cada candidato crudo, antes de que
-nadie lo confirme, desperdiciaría llamadas en contactos que terminan descartados como ruido. La
-mensajería se dispara por separado vía `POST /bd-runs/{run_id}/messages` (ver Endpoints), que:
+### Modos de búsqueda
 
-1. Busca en `scraper_leads` las filas de `lead_ids` para ese `run_id`/`organization_id`
-2. Descarta cualquiera que siga en `verification_status = 'pending'` (guardia de seguridad —
-   nunca se genera mensaje para un candidato no confirmado, sin importar qué envíe el caller)
-3. `get_organization_product_description` y `get_channel_hooks` desde Supabase
-4. `generate_bd_messages_for_batch` — modo BD Group (ver sección de Mensajería más abajo)
-5. Escribe `custom1`/`custom2` de vuelta en cada fila de `scraper_leads`
+Combinables: se manda lo que la seed list tenga configurado.
+
+- **Por empresa** — `company_names` → `current_company_names`. Se batchea de a 10 (límite del actor) y se piden 3 resultados por empresa (`BRIDGE_RESULTS_PER_COMPANY`), porque poca gente tiene estos títulos en una misma empresa.
+- **Por filtros** — `industry_codes`, `company_headcounts`, `geo_codes`. Sin ancla por empresa, se topea en 1 página (100).
+
+Los filtros vacíos **se omiten** del input en vez de mandarse como arrays vacíos.
+
+### Keywords fijas
+
+`BRIDGE_TITLE_KEYWORDS` (17 títulos de partnerships en inglés, español y chino) es fijo y **no configurable por el admin**, a diferencia de los combos de Leads. El admin solo elige en qué empresas/industrias buscar.
+
+### `industry_codes` puede no estar soportado
+
+No está confirmado que el actor acepte ese campo, y el actor rechaza el **input entero** ante un campo desconocido. Por eso `_init_bridge_search` lo intenta con `industry_codes` y, si el actor rechaza el input, **reintenta una vez sin él**, logueando `"industry_codes not supported by actor, retrying without it"`. Se pierde ese filtro, no el run. Un error sobre *otro* campo se propaga sin enmascararse.
+
+### Dedup aislado
+
+`dedup_bridge_candidates` consulta **solo** `bridge_candidates`, nunca `scraper_leads` ni `prospects`. La identidad es `(company_name, linkedin_url)`: la misma persona puede ser contacto de partnership para más de una empresa. Una persona puede ser legítimamente lead de venta **y** contacto de partnership, y esos pipelines no deben filtrarse entre sí.
 
 ## Endpoints
+
+### Leads
 
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | Health check |
-| POST | `/runs` | Inicia un run de leads individuales (debe existir en Supabase con status `pending`) |
-| POST | `/bd-runs` | Inicia un run de BD Group (búsqueda por empresa objetivo; debe existir en Supabase con status `pending`) |
-| POST | `/bd-runs/{run_id}/messages` | Genera mensajes solo para candidatos BD Group ya confirmados por un humano (no se llama automáticamente durante el scraping) |
-| GET | `/runs/{run_id}` | Estado del run (sirve para ambos pipelines — comparten la tabla `runs`) |
+| POST | `/runs` | Inicia un run (la fila debe existir en `runs` con status `pending`) |
+| GET | `/runs/{run_id}` | Estado del run |
 | GET | `/runs/{run_id}/logs` | Logs del run |
 | DELETE | `/runs/{run_id}` | Cancela el run si está activo |
 
-## Esquema de Supabase
+### Bridge
 
-El backend nunca crea tablas ni columnas — sólo lee/escribe sobre el esquema que ya existe en el proyecto de Supabase del CRM. Referencia de tablas y columnas usadas por este backend:
+| Método | Ruta | Descripción |
+|---|---|---|
+| POST | `/bridge/seed-lists` | Crea una seed list |
+| GET | `/bridge/seed-lists?organization_id=` | Lista las seed lists de una org |
+| POST | `/bridge/runs` | Inicia un run (la fila debe existir en `bridge_runs` con status `pending`) |
+| GET | `/bridge/runs/{run_id}?organization_id=` | Estado del run |
+| GET | `/bridge/runs/{run_id}/logs?organization_id=` | Logs del run |
+| GET | `/bridge/candidates?run_id=&organization_id=` | Candidatos de un run |
+| PATCH | `/bridge/candidates/{candidate_id}` | Confirma / rechaza / restaura un candidato |
 
-| Tabla | Columnas usadas por este backend |
-|---|---|
-| `runs` | `id` (PK, **no** `run_id`), `organization_id`, `status`, `plan`, `markets`, `combos`, `total_leads`, `total_leads_requested`, `hot_count`, `warm_count`, `cold_count`, `error_message`, `started_at`, `completed_at` |
-| `run_logs` | `run_id`, `level`, `message`, `created_at` |
-| `run_sdr_assignments` | `run_id`, `sdr_id`, `sender_profile_id`, `assigned_markets`, `leads_assigned` |
-| `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
-| `scraper_combos_master` | `code` (**no** `combo_code`) |
-| `sender_profiles` | `id`, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area`, `connection_note_max_chars`, `followup_max_chars` |
-| `scraper_leads` / `prospects` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `title`, `company`, `market`, `icp_score`, `custom1`, `custom2`, `assigned_to` (solo `prospects`), `outreach_status` (solo `prospects`); `temperature` ya no se autoasigna, queda en blanco al insertar; para BD Group además `lead_type`, `seed_company_name`, `verification_status`, y `channel_family` (asumido — usado para elegir el `hook_copy` de `org_channel_hooks`, ver nota abajo) |
-| `org_company_seed_lists` | `organization_id`, `list_name`, `company_names[]`, `market`, `title_keywords[]`, `seniority_levels[]` (BD Group) |
-| `org_icp_keywords` | `organization_id`, `category` (`industry`, `ai_signal`, `decision_title`, `influencer_title`), `keyword`, `weight` |
-| `org_channel_hooks` | `organization_id`, `channel_family`, `hook_copy` (ángulo propio de la org para mensajería BD Group) |
-| `monthly_lead_counts` | `organization_id`, `year_month`, `lead_count` |
-| `organizations` | `id`, `product_description` (descripción del producto de la org, usada para dar contexto real en los mensajes; las credenciales `anthropic_key`, `anthropic_base_url`, `anthropic_model`, `apify_token` siguen viajando en el request, nunca se leen desde esta tabla) |
+Tanto `POST /runs` como `POST /bridge/runs` son **fire-and-forget**: validan y lanzan la tarea con `asyncio.create_task`, devolviendo de inmediato. El CRM debe hacer polling del estado.
 
-> ⚠️ `channel_family` en `scraper_leads` no fue verificado contra el esquema real de Supabase —
-> se asume que la CRM lo setea al confirmar un candidato BD Group (junto con `verification_status`).
-> Si el nombre real de la columna es otro, `lead.get("channel_family")` en
-> `api/message_generator.py` simplemente no encuentra el hook y degrada a un pitch genérico sin
-> error — pero conviene confirmar el nombre real antes de depender de esto en producción.
+## Aislamiento multi-tenant
 
-> ⚠️ Antes de tocar cualquier query nueva contra Supabase, verificar el nombre exacto de la columna contra esta tabla. Varios de los bugs en producción (ver changelog) fueron justamente nombres de columna que no coincidían con el esquema real.
+Este backend usa el **service role key** de Supabase, que **bypassa RLS por completo**. Es decir: **RLS no protege contra un bug de filtrado en este código**. La única defensa real es que cada query filtre correctamente por `organization_id`. RLS sigue siendo útil como defensa en profundidad para cualquier consumidor que acceda con la sesión de un usuario (el CRM client-side), pero no para este servicio.
+
+Reglas que se siguen en todo el código:
+
+- **`organization_id` va en el `WHERE`**, no como chequeo posterior. Un id de otro tenant simplemente no matchea ninguna fila. PostgREST combina los `.eq()`/`.in_()` encadenados en un único `WHERE ... AND ...`, así que el orden en Python no altera la evaluación en SQL.
+- **`get_sender_profile(profile_id, organization_id)`** exige la org. Antes filtraba solo por `id`, lo que permitía que una organización usara el `sender_profile_id` de otra y generara mensajes bajo la identidad real de un SDR ajeno.
+- **`_assert_owned_by_org(row, organization_id, resource)`** valida el dueño real del recurso antes de operar. **Falla cerrado**: una fila con `organization_id` ausente o `null` también se rechaza (403).
+- **Al insertar, `organization_id` viene siempre del parámetro validado**, nunca de datos scrapeados.
+- `bridge_run_logs` no tiene `organization_id`; el acceso a sus logs se autoriza vía el run padre.
 
 ## Mensajería con Claude / proveedores custom
 
-`api/message_generator.py` no hardcodea el modelo ni el proveedor: ambos viajan en el `RunRequest`:
+`api/message_generator.py` no hardcodea modelo ni proveedor: ambos viajan en el `RunRequest`.
 
-- `anthropic_key` — API key, nunca se persiste.
-- `anthropic_base_url` — default `https://api.anthropic.com`; se puede apuntar a un proxy custom (p. ej. AITokenKing).
-- `anthropic_model` — default `claude-sonnet-4-6`.
+- `anthropic_key` — nunca se persiste.
+- `anthropic_base_url` — default `https://api.anthropic.com`; se puede apuntar a un proxy custom (p. ej. AITokenKing). **Si termina en `/v1` se le recorta**, porque el SDK de Anthropic agrega `/v1` por su cuenta y quedaría `/v1/v1`.
+- `anthropic_model` — se pasa **exactamente como viene**, sin normalizar. Ojo: los proxies tienen su propia nomenclatura; AITokenKing, por ejemplo, no acepta los IDs oficiales de Anthropic. Consultá su `/models` para ver la lista real.
 
-El cliente se inicializa como `anthropic.Anthropic(api_key=anthropic_key, base_url=anthropic_base_url)` y cada llamada a `messages.create` usa `model=anthropic_model`.
+### Generación en paralelo
 
-Reglas de contenido (ambos modos, individual y BD Group):
+Los mensajes se generan **concurrentemente** con `anthropic.AsyncAnthropic` + `asyncio.gather`, acotados por `asyncio.Semaphore(MESSAGE_CONCURRENCY = 6)`. Antes era secuencial (~5 s por lead), y 90 leads tardaban ~8 min, provocando 504 en el polling del CRM. Con 6 en paralelo baja a ~80 s. Verificado que el proxy de AITokenKing responde 200 (sin 429) con 6 concurrentes; si aparecieran 429, bajar esa constante a 3-4.
+
+El progreso se loguea **por lote** (`"Generated messages for 24/90 leads"`), no por mensaje.
+
+### Resiliencia ante respuestas cortadas
+
+Una sola respuesta truncada solía tirar el run entero y perder todos los mensajes ya generados. Tres defensas:
+
+- `_parse_response` **rescata** `custom1`/`custom2` por separado si el JSON viene truncado, así una `custom2` cortada no se lleva puesta también a la `custom1` completa.
+- `try/except` **por lead**: una respuesta mala loguea un warning y saltea ese lead, sin tumbar el batch.
+- `MESSAGE_MAX_TOKENS = 2048`, para que mensajes largos en español o chino no se corten a la mitad.
+
+### Reglas de contenido
+
 - **Basic**: mensajes genéricos, sin nombre ni firma del sender.
-- **Premium+**: perfil completo del SDR (`years_experience`, `seniority`, `expertise_area`) para dar contexto real.
-- `custom1` (connection request) / `custom2` (follow-up): el límite de caracteres ya no está hardcodeado — viene de `sender_profiles.connection_note_max_chars` / `followup_max_chars`. Si el sender profile no los tiene seteados, se usa el default histórico (300 / 500).
-- `get_organization_product_description` se resuelve una vez por run y se inyecta en el prompt de cada mensaje (individual y BD) para que la mensajería describa algo concreto de lo que vende la org. Si la org no lo llenó todavía, esa parte del prompt simplemente se omite — sin error, sin placeholder inventado.
+- **Premium+**: perfil completo del SDR (`years_experience`, `seniority`, `expertise_area`).
+- Límites de caracteres desde `sender_profiles.connection_note_max_chars` / `followup_max_chars`; default 300 / 500.
+- **`company_context`** (texto libre que configura el admin, viaja en el `RunRequest`) se inyecta en el prompt para que el mensaje suene informado sobre el negocio. Si viene vacío, esa sección se omite por completo.
+- **Idioma por mercado**: si no hay sender profile (Basic) o su idioma es el default, se usa el del mercado — `taiwan→zh`, `latam→es`, `vietnam→vi`, `global→en`. Se resuelve **por lead**, no por batch.
 
-**Modo BD Group** (`generate_bd_messages_for_batch`), distinto del modo individual:
-- Encuadre en tercera persona ("your customers have this problem") en vez de segunda persona — es
-  una propuesta de partnership, no una venta directa.
-- Usa el `hook_copy` propio de la org para el `channel_family` de ese contacto (desde
-  `org_channel_hooks`) como ángulo central, en vez de un pitch genérico. Sin hook configurado para
-  ese `channel_family` → pitch genérico, sin error.
-- Respeta el mismo límite real del sender (por `sender_profiles`) como techo duro, pero el prompt
-  pide explícitamente usar una porción notablemente mayor de ese espacio que un mensaje individual
-  típico — sin un largo objetivo hardcodeado, solo la instrucción de aprovechar el espacio
-  disponible.
-- Solo se genera bajo demanda vía `POST /bd-runs/{run_id}/messages`, nunca automáticamente durante
-  el scraping (ver sección de pipeline BD Group).
+## Concurrencia y el event loop
+
+`supabase-py` es **síncrono** y `run_scraping` bloquea por minutos (HTTP a Apify + `time.sleep` de polling). Ambos corrían directo dentro de handlers/tareas async sobre el mismo event loop que sirve la API, lo que **congelaba FastAPI** mientras un run scrapeaba: el `GET /runs/{run_id}` del CRM daba 504, y dos runs simultáneos se serializaban en vez de solaparse.
+
+Todo el trabajo bloqueante va ahora en `asyncio.to_thread`: `run_scraping`, `dedup_leads`, `import_leads_to_supabase`, los `log_run`, `update_run_status`, y las queries de todos los endpoints (incluidos los de polling). Medido con 2 runs concurrentes: antes, peor latencia de poll **3808 ms** con 1 poll atendido; después, **1 ms** con 11 atendidos, y los runs se solapan (2,0 s) en vez de serializarse (4,0 s).
+
+> El `log_fn` que se le pasa a `run_scraping` queda **síncrono a propósito**: ya se ejecuta dentro del worker thread.
+
+## Logging
+
+Railway marca como `error` todo lo que sale por **stderr**. Como el logging default de Python escribe ahí, todos los logs normales aparecían en rojo y era imposible distinguir un error real.
+
+- El root logger escribe a **stdout** (`StreamHandler(sys.stdout)`, `force=True`).
+- `httpx`/`httpcore` en **WARNING** — logueaban cada request HTTP individual.
+- El log-streaming del actor de Apify (`"[apify.<actor> runId:...]"`) se desactiva con `logger=None` en `.call()`.
+- **`log_run()` escribe a los dos destinos**: stdout (con la severidad correcta) y la tabla `run_logs` (que es lo que el CRM muestra en vivo). Los errores reales usan `logging.error` para destacarse.
+- Los payloads se loguean en **una sola línea** (`json.dumps` sin `indent`).
+
+## Esquema de Supabase
+
+| Tabla | Columnas usadas |
+|---|---|
+| `runs` | `id` (PK, **no** `run_id`), `organization_id`, `status`, `total_leads`, `error_message`, `updated_at` |
+| `run_logs` | `run_id`, `level`, `message`, `created_at` |
+| `run_sdr_assignments` | `run_id`, `sdr_id`, `leads_assigned` |
+| `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
+| `scraper_combos_master` | `code` (**no** `combo_code`), `title_keywords`, `seniority_levels`, `company_headcounts` |
+| `sender_profiles` | `id`, **`organization_id`**, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area`, `connection_note_max_chars`, `followup_max_chars` |
+| `scraper_leads` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `first_name`, `last_name`, `company`, `title`, `location`, `icp_score`, `search_combo`, `custom1`, `custom2`, `market`, `exported_to_crm`, `created_at`. **No tiene `email`.** |
+| `prospects` | Solo se **lee** para dedup (`linkedin_url`). El insert lo hace el CRM. |
+| `monthly_lead_counts` | `organization_id`, **`year_month`** (`"YYYY-MM"`), **`count`** |
+| `bridge_seed_lists` | `id`, `organization_id`, `name`, `channel_family`, `company_names[]`, `industry_codes[]`, `company_headcounts[]`, `geo_codes[]` |
+| `bridge_runs` | `id`, `organization_id`, `seed_list_id`, `status`, `total_candidates`, `error_message`, `started_at`, `completed_at` |
+| `bridge_run_logs` | `run_id`, `level`, `message`, `created_at` |
+| `bridge_candidates` | `run_id`, `organization_id`, `seed_list_id`, `channel_family`, `company_name` (NOT NULL), `full_name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `about`, `verification_status`, `created_at`, `updated_at` |
+
+> ⚠️ Antes de escribir cualquier query nueva, verificá el nombre exacto de la columna contra esta tabla. **Casi todos los bugs de producción de este proyecto fueron nombres de columna que no coincidían con el esquema real** (ver changelog).
 
 ## Variables de entorno
 
-Solo estas dos — las API keys de Apify y Claude viajan en cada request y nunca se persisten:
+Solo estas dos — las API keys de Apify y Claude viajan en cada request:
 
 ```
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
 ```
 
-`SUPABASE_URL` se normaliza automáticamente en `api/database.py` (se le quita `/rest/v1`, `/auth/v1` o `/` al final) para evitar el error `PGRST125 — Invalid path specified in request URL` que ocurre si el valor configurado en Railway ya trae ese sufijo. Aun así, configúrala como la URL base del proyecto (`https://<proyecto>.supabase.co`), sin sufijos.
+`SUPABASE_URL` se normaliza en `api/database.py` (se le quita `/rest/v1`, `/auth/v1` o `/` final) para evitar `PGRST125`. Aun así, configurala como la URL base (`https://<proyecto>.supabase.co`).
 
 ## Deploy
 
-Diseñado para desplegarse en [Railway](https://railway.app) usando el `Procfile` incluido:
+Railway, con el `Procfile` incluido:
 
 ```
 web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 ```
 
-## Changelog de fixes de esquema
-
-Historial de bugs de producción encontrados y corregidos, para no reintroducirlos:
+## Changelog de fixes
 
 | Fecha | Problema | Fix |
 |---|---|---|
-| 2026-07-08 | `runs` no tiene columna `run_id` (la PK es `id`) → `PGRST125` en `POST /runs`, `GET /runs/{run_id}` y `update_run_status` | Todas las queries contra `runs` filtran por `id` |
-| 2026-07-08 | `update_run_status` completaba el run con `total_leads_imported`, columna inexistente | Se usa `total_leads`, `hot_count`, `warm_count`, `cold_count` (derivados del `icp_tier` de cada lead) |
-| 2026-07-08 | `SUPABASE_URL` con sufijo `/rest/v1` duplica el path y provoca `PGRST125` en cualquier tabla | `_normalize_supabase_url()` limpia el sufijo antes de crear el cliente |
-| 2026-07-08 | `update_run_status` enviaba `updated_at`, columna inexistente en `runs` | Se eliminó del payload; solo se envían `status` + kwargs válidos |
-| 2026-07-08 | `org_combos` se filtraba por `enabled`, la columna real es `is_active` | Query corregida a `.eq("is_active", True)` |
-| 2026-07-08 | `scraper_combos_master` se filtraba por `combo_code`, la columna real es `code` | Query corregida a `.in_("code", ...)` (nota: `org_combos.combo_code` sí existe y es distinto — no se tocó) |
+| 2026-07-08 | `runs` no tiene `run_id` (la PK es `id`) → `PGRST125` | Todas las queries contra `runs` filtran por `id` |
+| 2026-07-08 | `SUPABASE_URL` con sufijo `/rest/v1` duplica el path → `PGRST125` | `_normalize_supabase_url()` |
+| 2026-07-08 | `org_combos` se filtraba por `enabled` | La columna real es `is_active` |
+| 2026-07-08 | `scraper_combos_master` se filtraba por `combo_code` | La columna real es `code` |
+| 2026-07-20 | El código leía `status` en la respuesta del actor; la señal real es `message == "ok"` | Se descartaban leads válidos. Corregido |
+| 2026-07-20 | `GEO_CODES.get(market)` fallaba con `"LATAM"` (claves en minúscula) → sin filtro geográfico | `market.lower()` |
+| 2026-07-20 | El actor exige `geo_codes` **enteros** | `int()` al construir el input |
+| 2026-07-20 | España (`105646813`) estaba en la lista `latam` | Removida |
+| 2026-07-20 | `scraper_leads` no tiene columna `email` → `PGRST204` | Fuera del insert |
+| 2026-07-20 | `monthly_lead_counts` usaba `month`/`lead_count` | Los reales son `year_month`/`count` |
+| 2026-07-20 | Un `seniority_levels` fuera del enum del actor tumbaba el run | `_normalize_seniority_levels` mapea alias y descarta+loguea lo desconocido |
+| 2026-07-20 | Una respuesta truncada de Claude tiraba el batch entero | Rescate de JSON parcial + `try/except` por lead + `max_tokens` 2048 |
+| 2026-07-20 | Mensajes secuenciales: 90 leads = ~8 min → 504 en el polling | Paralelización con semáforo de 6 |
+| 2026-07-20 | `org_icp_keywords` no existía → `PGRST205` en todo run | ICP revertido a keywords hardcodeadas |
+| 2026-07-20 | Todos los logs salían como `error` en Railway (stderr) | Root logger a stdout, `httpx` a WARNING, `logger=None` en el actor |
+| 2026-07-23 | Trabajo bloqueante congelaba el event loop → 504 y runs serializados | Todo en `asyncio.to_thread` |
+| 2026-07-23 | `get_sender_profile` filtraba solo por `id` → fuga cross-tenant de identidad de SDRs | Exige `organization_id` |
+| 2026-07-23 | Los endpoints no validaban que el `run_id` fuera de la org del request | `_assert_owned_by_org`, 403 y falla cerrado |
 
 ## Verificación
 
-Antes de cada push, validar sintaxis de todos los módulos:
+```
+python3 -m py_compile api/*.py scraper/*.py
+```
 
-```
-python -m py_compile api/*.py scraper/*.py
-```
+Ver también [HANDOFF.md](HANDOFF.md) para las peculiaridades del actor de Apify y del esquema de Supabase.
