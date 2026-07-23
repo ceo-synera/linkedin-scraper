@@ -136,6 +136,15 @@ parten en batches.
 
 ## Supabase
 
+### Autenticación de entrada
+
+Todo endpoint salvo `/health` exige el header `X-Internal-Api-Key`, comparado
+contra la env var `INTERNAL_API_KEY`. **Solo se aplica si esa variable está
+seteada** — si falta, el backend acepta a todos y loguea un WARNING al arrancar.
+Eso es lo que permitió deployar el backend antes de actualizar el CRM. Si un
+request empieza a dar 401 inesperadamente, revisar que el CRM esté mandando el
+header y que el valor coincida con el de Railway.
+
 ### El backend usa el service role key → **RLS no lo limita**
 
 Consecuencia importante: **RLS no protege contra un bug de filtrado en este

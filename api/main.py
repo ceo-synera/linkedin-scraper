@@ -1,11 +1,14 @@
 import asyncio
 import logging
+import os
+import secrets
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from api.bridge_job_runner import run_bridge_job
 from api.bridge_models import (
@@ -47,6 +50,63 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Server-to-server authentication
+#
+# A shared secret the CRM sends on every request, so only the authorized CRM —
+# not anyone who discovers the Railway URL — can talk to this backend at all.
+# This is a layer ON TOP of the per-request organization_id checks, which keep
+# protecting one organization's data from another. It is NOT the Supabase
+# service role key.
+# ---------------------------------------------------------------------------
+INTERNAL_API_KEY_HEADER = "x-internal-api-key"
+INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY")
+
+# /health stays open: Railway (and any uptime probe) hits it without custom
+# headers, and requiring auth there would fail the platform healthcheck and
+# block deploys. It exposes nothing but a status string and a version.
+PUBLIC_PATHS = frozenset({"/health"})
+
+if INTERNAL_API_KEY:
+    logging.getLogger("scraper").info(
+        "Internal API authentication ENABLED (X-Internal-Api-Key required)"
+    )
+else:
+    logging.getLogger("scraper").warning(
+        "INTERNAL_API_KEY is not set — internal API authentication is DISABLED. "
+        "Every caller is accepted. Set INTERNAL_API_KEY in Railway once the CRM "
+        "sends the X-Internal-Api-Key header."
+    )
+
+
+def _is_authorized(path: str, provided_key: Optional[str]) -> bool:
+    """Whether a request may proceed.
+
+    Returns True when auth isn't configured yet, so the backend can be deployed
+    before the CRM is updated: enforcement switches on the moment
+    INTERNAL_API_KEY is set in Railway, with no code change and no window where
+    the CRM is locked out. Once set, a missing or wrong key is rejected.
+    """
+    if path in PUBLIC_PATHS:
+        return True
+    if not INTERNAL_API_KEY:
+        return True
+    if not provided_key:
+        return False
+    # Constant-time compare so a wrong key can't be recovered by timing.
+    return secrets.compare_digest(provided_key, INTERNAL_API_KEY)
+
+
+@app.middleware("http")
+async def enforce_internal_api_key(request: Request, call_next: Any) -> Any:
+    if not _is_authorized(request.url.path, request.headers.get(INTERNAL_API_KEY_HEADER)):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or missing X-Internal-Api-Key"},
+        )
+    return await call_next(request)
 
 active_tasks: Dict[str, asyncio.Task] = {}
 

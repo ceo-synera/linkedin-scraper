@@ -151,6 +151,34 @@ No está confirmado que el actor acepte ese campo, y el actor rechaza el **input
 
 Tanto `POST /runs` como `POST /bridge/runs` son **fire-and-forget**: validan y lanzan la tarea con `asyncio.create_task`, devolviendo de inmediato. El CRM debe hacer polling del estado.
 
+## Autenticación server-to-server
+
+Todo request al backend (excepto `/health`) debe incluir el header:
+
+```
+X-Internal-Api-Key: <INTERNAL_API_KEY>
+```
+
+Sin ese header, o con uno incorrecto, la respuesta es **401**. Es un secreto
+compartido con el CRM, **no** el service role de Supabase.
+
+Esto **no reemplaza** la validación de `organization_id` — esa sigue protegiendo
+los datos de una organización frente a otra. Esta capa responde una pregunta
+distinta: *quién puede hablarle al backend en absoluto*. Sin ella, cualquiera que
+descubriera la URL de Railway podía llamar a cualquier endpoint y, pasando un
+`organization_id` arbitrario, leer datos de cualquier org.
+
+**La aplicación es condicional a que `INTERNAL_API_KEY` esté seteada.** Si la
+variable no existe, el backend acepta a todos y loguea un WARNING al arrancar.
+Es deliberado: permite deployar el backend antes de tocar el CRM y activar la
+autenticación después, sin una ventana en la que el CRM quede bloqueado. Una vez
+seteada, la validación es inmediata y la comparación es de tiempo constante
+(`secrets.compare_digest`).
+
+`/health` queda público a propósito: el healthcheck de Railway lo consulta sin
+headers custom, y exigirle auth haría fallar los deploys. No expone nada más que
+un status y la versión.
+
 ## Aislamiento multi-tenant
 
 Este backend usa el **service role key** de Supabase, que **bypassa RLS por completo**. Es decir: **RLS no protege contra un bug de filtrado en este código**. La única defensa real es que cada query filtre correctamente por `organization_id`. RLS sigue siendo útil como defensa en profundidad para cualquier consumidor que acceda con la sesión de un usuario (el CRM client-side), pero no para este servicio.
@@ -235,11 +263,12 @@ Railway marca como `error` todo lo que sale por **stderr**. Como el logging defa
 
 ## Variables de entorno
 
-Solo estas dos — las API keys de Apify y Claude viajan en cada request:
+Las API keys de Apify y Claude viajan en cada request y nunca se persisten.
 
 ```
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
+INTERNAL_API_KEY          # secreto compartido con el CRM (ver Autenticación)
 ```
 
 `SUPABASE_URL` se normaliza en `api/database.py` (se le quita `/rest/v1`, `/auth/v1` o `/` final) para evitar `PGRST125`. Aun así, configurala como la URL base (`https://<proyecto>.supabase.co`).
@@ -274,6 +303,7 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-23 | Trabajo bloqueante congelaba el event loop → 504 y runs serializados | Todo en `asyncio.to_thread` |
 | 2026-07-23 | `get_sender_profile` filtraba solo por `id` → fuga cross-tenant de identidad de SDRs | Exige `organization_id` |
 | 2026-07-23 | Los endpoints no validaban que el `run_id` fuera de la org del request | `_assert_owned_by_org`, 403 y falla cerrado |
+| 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
 
 ## Verificación
 
