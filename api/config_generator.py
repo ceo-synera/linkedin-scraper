@@ -70,13 +70,24 @@ def get_channel_hooks(organization_id: str) -> Dict[str, str]:
     return {row["channel_family"]: row["hook_copy"] for row in res.data}
 
 
-def get_sender_profile(profile_id: str) -> Optional[SenderProfile]:
+def get_sender_profile(
+    profile_id: str, organization_id: str
+) -> Optional[SenderProfile]:
+    """Fetch a sender profile, scoped to the requesting organization.
+
+    organization_id is part of the WHERE clause, not a post-fetch check: a
+    profile_id belonging to another tenant simply matches no row and returns
+    None, exactly as if it didn't exist. Without this scoping any org could
+    pass another org's sender_profile_id and generate outreach under a real
+    SDR identity that isn't theirs.
+    """
     supabase = get_supabase()
 
     res = (
         supabase.table("sender_profiles")
         .select("*")
         .eq("id", profile_id)
+        .eq("organization_id", organization_id)
         .limit(1)
         .execute()
     )

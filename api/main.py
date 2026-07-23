@@ -50,7 +50,28 @@ active_tasks: Dict[str, asyncio.Task] = {}
 # helpers stay sync and are dispatched with asyncio.to_thread by the handlers.
 def _fetch_run_status(run_id: str) -> Any:
     supabase = get_supabase()
-    return supabase.table("runs").select("id,status").eq("id", run_id).limit(1).execute()
+    return (
+        supabase.table("runs")
+        .select("id,status,organization_id")
+        .eq("id", run_id)
+        .limit(1)
+        .execute()
+    )
+
+
+def _assert_run_belongs_to_org(run_row: Dict[str, Any], organization_id: str) -> None:
+    """Reject a run_id that belongs to a different tenant.
+
+    Without this, knowing (or guessing) another org's pending run_id would let
+    a caller start a pipeline under a run row they don't own — the scraped data
+    itself stays correctly scoped, but that run's status/counters would be
+    driven by someone else's request.
+    """
+    if run_row.get("organization_id") != organization_id:
+        raise HTTPException(
+            status_code=403,
+            detail="This run does not belong to your organization",
+        )
 
 
 def _fetch_run(run_id: str) -> Any:
@@ -81,6 +102,8 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    _assert_run_belongs_to_org(existing.data[0], run_request.organization_id)
+
     if existing.data[0]["status"] != "pending":
         raise HTTPException(
             status_code=409,
@@ -104,6 +127,8 @@ async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    _assert_run_belongs_to_org(existing.data[0], bd_run_request.organization_id)
+
     if existing.data[0]["status"] != "pending":
         raise HTTPException(
             status_code=409,
@@ -126,6 +151,8 @@ async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) 
 
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
+
+    _assert_run_belongs_to_org(existing.data[0], message_request.organization_id)
 
     def _on_done(task: asyncio.Task, run_id: str = run_id) -> None:
         active_tasks.pop(run_id, None)

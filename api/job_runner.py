@@ -22,11 +22,14 @@ async def _log(run_id: str, level: str, message: str) -> None:
     await asyncio.to_thread(log_run, run_id, level, message)
 
 
-def _resolve_sender_profile(assignment) -> Optional[SenderProfile]:
+def _resolve_sender_profile(assignment, organization_id: str) -> Optional[SenderProfile]:
+    # SdrAssignment carries no organization_id of its own, so the run's org is
+    # threaded in explicitly — a sender_profile_id from another tenant must
+    # resolve to None rather than leaking that SDR's identity.
     if assignment.sender_profile is not None:
         return assignment.sender_profile
     if assignment.sender_profile_id:
-        return get_sender_profile(assignment.sender_profile_id)
+        return get_sender_profile(assignment.sender_profile_id, organization_id)
     return None
 
 
@@ -229,7 +232,9 @@ async def run_job(run_request: RunRequest) -> None:
             assignment = assignments_by_sdr.get(sdr_id)
             # _resolve_sender_profile may hit Supabase (get_sender_profile).
             sender_profile = (
-                await asyncio.to_thread(_resolve_sender_profile, assignment)
+                await asyncio.to_thread(
+                    _resolve_sender_profile, assignment, organization_id
+                )
                 if assignment
                 else None
             )

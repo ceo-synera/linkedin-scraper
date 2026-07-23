@@ -23,7 +23,9 @@ def _resolve_sender_profile(request: BDMessageRequest) -> Optional[SenderProfile
     if request.sender_profile is not None:
         return request.sender_profile
     if request.sender_profile_id:
-        return get_sender_profile(request.sender_profile_id)
+        # Scoped to the request's own org — a sender_profile_id from another
+        # tenant resolves to None rather than leaking that SDR's identity.
+        return get_sender_profile(request.sender_profile_id, request.organization_id)
     return None
 
 
