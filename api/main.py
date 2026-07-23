@@ -44,6 +44,31 @@ app.add_middleware(
 active_tasks: Dict[str, asyncio.Task] = {}
 
 
+# supabase-py's client is synchronous, so every .execute() blocks the thread it
+# runs on. Called straight from an async handler that would freeze the whole
+# event loop — including the GET /runs/{id} polling the CRM depends on. These
+# helpers stay sync and are dispatched with asyncio.to_thread by the handlers.
+def _fetch_run_status(run_id: str) -> Any:
+    supabase = get_supabase()
+    return supabase.table("runs").select("id,status").eq("id", run_id).limit(1).execute()
+
+
+def _fetch_run(run_id: str) -> Any:
+    supabase = get_supabase()
+    return supabase.table("runs").select("*").eq("id", run_id).limit(1).execute()
+
+
+def _fetch_run_logs(run_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("run_logs")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok", "version": "1.0.0"}
@@ -51,15 +76,7 @@ async def health() -> Dict[str, str]:
 
 @app.post("/runs")
 async def start_run(run_request: RunRequest) -> Dict[str, str]:
-    supabase = get_supabase()
-
-    existing = (
-        supabase.table("runs")
-        .select("id,status")
-        .eq("id", run_request.run_id)
-        .limit(1)
-        .execute()
-    )
+    existing = await asyncio.to_thread(_fetch_run_status, run_request.run_id)
 
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -82,15 +99,7 @@ async def start_run(run_request: RunRequest) -> Dict[str, str]:
 
 @app.post("/bd-runs")
 async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
-    supabase = get_supabase()
-
-    existing = (
-        supabase.table("runs")
-        .select("id,status")
-        .eq("id", bd_run_request.run_id)
-        .limit(1)
-        .execute()
-    )
+    existing = await asyncio.to_thread(_fetch_run_status, bd_run_request.run_id)
 
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -113,15 +122,7 @@ async def start_bd_run(bd_run_request: BDRunRequest) -> Dict[str, str]:
 
 @app.post("/bd-runs/{run_id}/messages")
 async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) -> Dict[str, str]:
-    supabase = get_supabase()
-
-    existing = (
-        supabase.table("runs")
-        .select("id,status")
-        .eq("id", run_id)
-        .limit(1)
-        .execute()
-    )
+    existing = await asyncio.to_thread(_fetch_run_status, run_id)
 
     if not existing.data:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -138,9 +139,7 @@ async def start_bd_run_messages(run_id: str, message_request: BDMessageRequest) 
 
 @app.get("/runs/{run_id}")
 async def get_run(run_id: str) -> Dict[str, Any]:
-    supabase = get_supabase()
-
-    res = supabase.table("runs").select("*").eq("id", run_id).limit(1).execute()
+    res = await asyncio.to_thread(_fetch_run, run_id)
 
     if not res.data:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -150,15 +149,7 @@ async def get_run(run_id: str) -> Dict[str, Any]:
 
 @app.get("/runs/{run_id}/logs")
 async def get_run_logs(run_id: str) -> Dict[str, Any]:
-    supabase = get_supabase()
-
-    res = (
-        supabase.table("run_logs")
-        .select("*")
-        .eq("run_id", run_id)
-        .order("created_at", desc=False)
-        .execute()
-    )
+    res = await asyncio.to_thread(_fetch_run_logs, run_id)
 
     return {"run_id": run_id, "logs": res.data}
 

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 from datetime import datetime, timezone
@@ -14,6 +15,11 @@ from api.message_generator import generate_messages_for_batch
 from api.models import RunRequest, SenderProfile
 from scraper.apify_scraper import run_scraping
 from scraper.icp_scorer import score_leads
+
+
+async def _log(run_id: str, level: str, message: str) -> None:
+    """log_run writes to Supabase synchronously; keep it off the event loop."""
+    await asyncio.to_thread(log_run, run_id, level, message)
 
 
 def _resolve_sender_profile(assignment) -> Optional[SenderProfile]:
@@ -127,42 +133,53 @@ async def run_job(run_request: RunRequest) -> None:
     try:
         os.makedirs(run_dir, exist_ok=True)
 
-        update_run_status(run_id, "running")
-        log_run(
+        await asyncio.to_thread(update_run_status, run_id, "running")
+        await _log(
             run_id,
             "info",
             f"Run started — markets: {run_request.markets}, "
             f"combos: {run_request.combos}, total_leads: {run_request.total_leads}",
         )
 
-        combos = get_combo_definitions(organization_id, run_request.combos)
-        log_run(run_id, "info", f"Loaded {len(combos)} combo definition(s)")
+        combos = await asyncio.to_thread(
+            get_combo_definitions, organization_id, run_request.combos
+        )
+        await _log(run_id, "info", f"Loaded {len(combos)} combo definition(s)")
 
-        # Route the scraper's debug output into the CRM's run_logs.
-        log_run(run_id, "info", "Searching LinkedIn via Apify...")
-        raw_leads = run_scraping(
+        # run_scraping is fully synchronous (blocking Apify HTTP + time.sleep
+        # polling for minutes), so it runs in a worker thread — otherwise it
+        # freezes the event loop and every GET /runs/{id} poll times out. Its
+        # log_fn then executes on that worker thread, where the blocking
+        # log_run is the right call.
+        await _log(run_id, "info", "Searching LinkedIn via Apify...")
+        raw_leads = await asyncio.to_thread(
+            run_scraping,
             run_request.apify_token,
             combos,
             run_request.markets,
             run_request.total_leads,
             log_fn=lambda msg: log_run(run_id, "info", msg),
         )
-        log_run(run_id, "info", f"Received {len(raw_leads)} raw leads from Apify")
+        await _log(run_id, "info", f"Received {len(raw_leads)} raw leads from Apify")
 
-        log_run(run_id, "info", "Scoring leads...")
+        # score_leads / distribute_leads are pure in-memory CPU work (sub-ms for
+        # these volumes), so they stay on the loop.
+        await _log(run_id, "info", "Scoring leads...")
         scored_leads = score_leads(raw_leads)
         scored_hot = sum(1 for lead in scored_leads if lead.get("icp_tier") == "HOT")
         scored_warm = sum(1 for lead in scored_leads if lead.get("icp_tier") == "WARM")
         scored_cold = sum(1 for lead in scored_leads if lead.get("icp_tier") == "COLD")
-        log_run(
+        await _log(
             run_id,
             "info",
             f"Scored: {scored_hot} HOT, {scored_warm} WARM, {scored_cold} COLD",
         )
 
-        log_run(run_id, "info", "Checking for duplicates...")
-        new_leads, duplicates_count = dedup_leads(scored_leads, organization_id)
-        log_run(
+        await _log(run_id, "info", "Checking for duplicates...")
+        new_leads, duplicates_count = await asyncio.to_thread(
+            dedup_leads, scored_leads, organization_id
+        )
+        await _log(
             run_id,
             "info",
             f"Dedup complete: {len(new_leads)} new leads, "
@@ -170,7 +187,7 @@ async def run_job(run_request: RunRequest) -> None:
         )
 
         # Distribute to SDRs and generate outreach messages per SDR batch.
-        log_run(
+        await _log(
             run_id, "info", f"Distributing leads across {len(run_request.sdr_assignments)} SDRs..."
         )
         distribution = distribute_leads(new_leads, run_request.sdr_assignments)
@@ -185,7 +202,7 @@ async def run_job(run_request: RunRequest) -> None:
             assigned_markets = sorted(
                 {m for a in run_request.sdr_assignments for m in a.assigned_markets}
             )
-            log_run(
+            await _log(
                 run_id,
                 "error",
                 "No leads assigned to any SDR — likely a market-string mismatch. "
@@ -198,7 +215,7 @@ async def run_job(run_request: RunRequest) -> None:
         }
 
         if assigned_count:
-            log_run(
+            await _log(
                 run_id,
                 "info",
                 "Generating personalized messages (this may take a moment)...",
@@ -209,7 +226,12 @@ async def run_job(run_request: RunRequest) -> None:
                 continue
 
             assignment = assignments_by_sdr.get(sdr_id)
-            sender_profile = _resolve_sender_profile(assignment) if assignment else None
+            # _resolve_sender_profile may hit Supabase (get_sender_profile).
+            sender_profile = (
+                await asyncio.to_thread(_resolve_sender_profile, assignment)
+                if assignment
+                else None
+            )
             language = sender_profile.language if sender_profile else "en"
 
             sdr_market = (
@@ -232,7 +254,7 @@ async def run_job(run_request: RunRequest) -> None:
             for lead in sdr_leads:
                 lead["assigned_to"] = sdr_id
 
-            log_run(
+            await _log(
                 run_id,
                 "info",
                 f"Generated messages for SDR {sdr_id} ({len(sdr_leads)} leads)",
@@ -240,31 +262,35 @@ async def run_job(run_request: RunRequest) -> None:
 
         # Store leads + messages in scraper_leads. prospects is inserted later
         # by the CRM (it owns area_id / assignment context).
-        log_run(run_id, "info", "Saving leads to database...")
-        import_leads_to_supabase(new_leads, run_id, organization_id)
+        await _log(run_id, "info", "Saving leads to database...")
+        await asyncio.to_thread(
+            import_leads_to_supabase, new_leads, run_id, organization_id
+        )
 
         # Best-effort bookkeeping: a schema mismatch here must not fail a run
         # whose leads + messages were already stored.
         try:
-            _update_run_sdr_assignments(run_id, distribution)
-            _update_monthly_lead_counts(organization_id, len(new_leads))
+            await asyncio.to_thread(_update_run_sdr_assignments, run_id, distribution)
+            await asyncio.to_thread(
+                _update_monthly_lead_counts, organization_id, len(new_leads)
+            )
         except Exception as exc:
-            log_run(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
+            await _log(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
 
         # Hot/warm/cold is no longer derived at scrape time — that's an SDR
         # judgment call made later, once real outreach has happened.
-        update_run_status(
-            run_id,
-            "completed",
-            total_leads=len(new_leads),
+        await asyncio.to_thread(
+            update_run_status, run_id, "completed", total_leads=len(new_leads)
         )
-        log_run(
+        await _log(
             run_id, "info", f"Run completed successfully — {len(new_leads)} leads ready"
         )
 
     except Exception as exc:
-        log_run(run_id, "error", f"Run failed: {exc}")
-        update_run_status(run_id, "failed", error_message=str(exc))
+        await _log(run_id, "error", f"Run failed: {exc}")
+        await asyncio.to_thread(
+            update_run_status, run_id, "failed", error_message=str(exc)
+        )
         raise
 
     finally:

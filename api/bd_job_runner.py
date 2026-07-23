@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,11 @@ from api.dedup import dedup_leads
 from api.message_generator import generate_bd_messages_for_batch
 from api.models import BDMessageRequest, BDRunRequest, SenderProfile
 from scraper.apify_scraper import run_company_seed_scraping
+
+
+async def _log(run_id: str, level: str, message: str) -> None:
+    """log_run writes to Supabase synchronously; keep it off the event loop."""
+    await asyncio.to_thread(log_run, run_id, level, message)
 
 
 def _resolve_sender_profile(request: BDMessageRequest) -> Optional[SenderProfile]:
@@ -92,49 +98,68 @@ async def run_bd_job(bd_run_request: BDRunRequest) -> None:
     organization_id = bd_run_request.organization_id
 
     try:
-        update_run_status(run_id, "running")
-        log_run(run_id, "info", "BD Group run started")
+        await asyncio.to_thread(update_run_status, run_id, "running")
+        await _log(run_id, "info", "BD Group run started")
 
-        seed_lists = get_company_seed_lists(organization_id, bd_run_request.seed_list_ids)
-        log_run(run_id, "info", f"Loaded {len(seed_lists)} company seed lists")
+        seed_lists = await asyncio.to_thread(
+            get_company_seed_lists, organization_id, bd_run_request.seed_list_ids
+        )
+        await _log(run_id, "info", f"Loaded {len(seed_lists)} company seed lists")
 
         channel_family_by_seed_list_id = {
             seed_list["id"]: seed_list.get("channel_family") for seed_list in seed_lists
         }
 
-        raw_leads = run_company_seed_scraping(
+        # Blocking Apify scraping (HTTP + time.sleep polling) — off the loop.
+        raw_leads = await asyncio.to_thread(
+            run_company_seed_scraping,
             bd_run_request.apify_token,
             seed_lists,
             bd_run_request.total_leads,
             log_fn=lambda msg: log_run(run_id, "info", msg),
         )
-        log_run(run_id, "info", f"Scraped {len(raw_leads)} raw BD candidates")
+        await _log(run_id, "info", f"Scraped {len(raw_leads)} raw BD candidates")
 
-        new_leads, duplicates_count = dedup_leads(raw_leads, organization_id)
-        log_run(
+        new_leads, duplicates_count = await asyncio.to_thread(
+            dedup_leads, raw_leads, organization_id
+        )
+        await _log(
             run_id,
             "info",
             f"Dedup complete: {len(new_leads)} new candidates, {duplicates_count} duplicates",
         )
 
-        import_bd_candidates_to_supabase(
-            new_leads, run_id, organization_id, channel_family_by_seed_list_id
+        await asyncio.to_thread(
+            import_bd_candidates_to_supabase,
+            new_leads,
+            run_id,
+            organization_id,
+            channel_family_by_seed_list_id,
         )
-        log_run(run_id, "info", f"Stored {len(new_leads)} BD candidates in scraper_leads")
+        await _log(run_id, "info", f"Stored {len(new_leads)} BD candidates in scraper_leads")
 
         # Best-effort bookkeeping: a schema mismatch here must not fail a run
         # whose candidates were already stored.
         try:
-            _update_run_sdr_assignment(run_id, bd_run_request.owner_sdr_id, len(new_leads))
+            await asyncio.to_thread(
+                _update_run_sdr_assignment,
+                run_id,
+                bd_run_request.owner_sdr_id,
+                len(new_leads),
+            )
         except Exception as exc:
-            log_run(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
+            await _log(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
 
-        update_run_status(run_id, "completed", total_leads=len(new_leads))
-        log_run(run_id, "info", "BD Group run completed")
+        await asyncio.to_thread(
+            update_run_status, run_id, "completed", total_leads=len(new_leads)
+        )
+        await _log(run_id, "info", "BD Group run completed")
 
     except Exception as exc:
-        log_run(run_id, "error", f"BD Group run failed: {exc}")
-        update_run_status(run_id, "failed", error_message=str(exc))
+        await _log(run_id, "error", f"BD Group run failed: {exc}")
+        await asyncio.to_thread(
+            update_run_status, run_id, "failed", error_message=str(exc)
+        )
         raise
 
 
@@ -164,13 +189,15 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
     organization_id = request.organization_id
 
     try:
-        log_run(
+        await _log(
             run_id,
             "info",
             f"BD messaging requested for {len(request.lead_ids)} lead(s)",
         )
 
-        supabase, rows = _fetch_bd_leads_by_id(run_id, organization_id, request.lead_ids)
+        supabase, rows = await asyncio.to_thread(
+            _fetch_bd_leads_by_id, run_id, organization_id, request.lead_ids
+        )
 
         # Guard against generating messages for anything other than a
         # human-confirmed candidate. verification_status's CHECK constraint
@@ -182,7 +209,7 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
         leads = [row for row in rows if row.get("verification_status") == "confirmed"]
         skipped = len(rows) - len(leads)
         if skipped:
-            log_run(
+            await _log(
                 run_id,
                 "info",
                 f"Skipped {skipped} lead(s) not verification_status='confirmed' "
@@ -190,12 +217,15 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
             )
 
         if not leads:
-            log_run(run_id, "info", "No confirmed BD leads to message; nothing to do")
+            await _log(run_id, "info", "No confirmed BD leads to message; nothing to do")
             return
 
-        sender_profile = _resolve_sender_profile(request)
+        # _resolve_sender_profile / get_channel_hooks may hit Supabase.
+        sender_profile = await asyncio.to_thread(_resolve_sender_profile, request)
         language = sender_profile.language if sender_profile else "en"
-        hook_copy_by_channel_family = get_channel_hooks(organization_id)
+        hook_copy_by_channel_family = await asyncio.to_thread(
+            get_channel_hooks, organization_id
+        )
 
         await generate_bd_messages_for_batch(
             leads,
@@ -209,13 +239,16 @@ async def run_bd_messages_job(run_id: str, request: BDMessageRequest) -> None:
             log_fn=lambda msg: log_run(run_id, "info", msg),
         )
 
-        for lead in leads:
-            supabase.table("scraper_leads").update(
-                {"custom1": lead.get("custom1"), "custom2": lead.get("custom2")}
-            ).eq("id", lead["id"]).execute()
+        def _persist_messages() -> None:
+            for lead in leads:
+                supabase.table("scraper_leads").update(
+                    {"custom1": lead.get("custom1"), "custom2": lead.get("custom2")}
+                ).eq("id", lead["id"]).execute()
 
-        log_run(run_id, "info", f"BD messaging completed for {len(leads)} lead(s)")
+        await asyncio.to_thread(_persist_messages)
+
+        await _log(run_id, "info", f"BD messaging completed for {len(leads)} lead(s)")
 
     except Exception as exc:
-        log_run(run_id, "error", f"BD messaging failed: {exc}")
+        await _log(run_id, "error", f"BD messaging failed: {exc}")
         raise

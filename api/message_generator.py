@@ -264,7 +264,10 @@ async def _run_batch(
         # completed batch rather than per individual message.
         completed += 1
         if log_fn and (completed % MESSAGE_CONCURRENCY == 0 or completed == total):
-            log_fn(f"Generated messages for {completed}/{total} leads")
+            # log_fn writes to Supabase synchronously — keep it off the loop.
+            await asyncio.to_thread(
+                log_fn, f"Generated messages for {completed}/{total} leads"
+            )
 
     await asyncio.gather(*(_process(lead) for lead in leads))
 
