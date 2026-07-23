@@ -98,6 +98,25 @@ COMPANY_HEADCOUNT_CODE_MAP = {
 }
 
 
+# The actor rejects any search with more than 20 title_keywords, failing the
+# whole input with InvalidRequestError. Truncating defensively means no combo —
+# present or future — can ever fail a run for this reason.
+MAX_TITLE_KEYWORDS = 20
+
+
+def _truncate_title_keywords(
+    values: List[str], emit: LogFn, label: str = "combo"
+) -> List[str]:
+    keywords = list(values or [])
+    if len(keywords) > MAX_TITLE_KEYWORDS:
+        emit(
+            f"[{label}] title_keywords has {len(keywords)} items, truncating to "
+            f"{MAX_TITLE_KEYWORDS} (Apify limit)"
+        )
+        return keywords[:MAX_TITLE_KEYWORDS]
+    return keywords
+
+
 def _normalize_company_headcounts(values: List[Any]) -> List[str]:
     normalized: List[str] = []
     for value in values or []:
@@ -322,7 +341,9 @@ def _scrape_combo(
 
     # Flow 1 — init search.
     init_input = {
-        "title_keywords": combo.get("title_keywords", []),
+        "title_keywords": _truncate_title_keywords(
+            combo.get("title_keywords", []), emit
+        ),
         "company_headcounts": _normalize_company_headcounts(
             combo.get("company_headcounts", [])
         ),
@@ -491,6 +512,8 @@ def run_bridge_scraping(
     """
     emit: LogFn = log_fn or log.info
     client = ApifyClient(apify_token)
+
+    title_keywords = _truncate_title_keywords(title_keywords, emit, label="bridge")
 
     # Filters shared by every search, only included when actually set so the
     # actor never receives empty arrays it might treat as "match nothing".
