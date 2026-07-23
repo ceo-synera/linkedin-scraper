@@ -1,7 +1,6 @@
 import json
 import logging
 import math
-import random
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -63,9 +62,10 @@ MAX_PROCESSING_RETRIES = 30  # 30 * 10s = 5 minutes
 # expected DB dedup losses (the actor tends to resurface the same top
 # profiles for a given filter set once they're already stored). Kept modest
 # (was 1.7): a bigger multiplier means more results per page to fetch and
-# process, which measurably lengthens every combo's Flow 2 cycle — the
-# per-cell target cap (see _trim_cell_leads) is what actually protects
-# against overshoot now, so this only needs to cover light dedup loss.
+# process, which measurably lengthens every combo's Flow 2 cycle. Overshoot
+# past total_leads is no longer capped per-cell — job_runner trims the global
+# pool by ICP score once, after scoring (see run_scraping's module docstring
+# note below and job_runner.run_job).
 OVERFETCH_MULTIPLIER = 1.2
 
 # Backfill cap: how many total pages (not extra pages — total, including
@@ -250,11 +250,27 @@ def _map_lead(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# If the actor's "processing" message (e.g. a "Done X/Y" progress indicator)
+# comes back byte-for-byte identical this many attempts in a row, the search
+# isn't making progress — stop polling this page instead of burning through
+# all MAX_PROCESSING_RETRIES attempts waiting for a change that isn't coming.
+STALL_LIMIT = 3
+
+
 def _fetch_page(
-    client: ApifyClient, request_id: str, page: int, emit: LogFn
+    client: ApifyClient,
+    request_id: str,
+    page: int,
+    emit: LogFn,
+    market: Optional[str] = None,
+    combo_code: Optional[str] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     # Returns the mapped leads for the page, an empty list when the page has
-    # no results, or None when the actor never stopped "processing".
+    # no results, or None when the actor never stopped "processing" (either it
+    # exhausted MAX_PROCESSING_RETRIES, or it stalled — see STALL_LIMIT).
+    last_message: Any = object()  # sentinel that can't equal a real message
+    stall_count = 0
+
     for attempt in range(MAX_PROCESSING_RETRIES):
         fetch_input = {"request_id": request_id, "page": page}
         emit(
@@ -281,6 +297,23 @@ def _fetch_page(
             leads = [_map_lead(item) for item in rows if isinstance(item, dict)]
             emit(f"[Flow 2 fetch] page {page} ok: {len(leads)} mapped leads")
             return leads
+
+        stall_count = stall_count + 1 if message == last_message else 1
+        last_message = message
+
+        if stall_count >= STALL_LIMIT:
+            if market is not None or combo_code is not None:
+                emit(
+                    f"[combo] market={market!r} code={combo_code!r} stalled at "
+                    f"{message!r} for {STALL_LIMIT} consecutive attempts, giving "
+                    "up on this combo early"
+                )
+            else:
+                emit(
+                    f"[Flow 2 fetch] page {page} stalled at {message!r} for "
+                    f"{STALL_LIMIT} consecutive attempts, giving up early"
+                )
+            return None
 
         emit(
             f"[Flow 2 fetch] page {page} not ready (message={message!r}), "
@@ -332,31 +365,6 @@ def _init_search(client: ApifyClient, init_input: Dict[str, Any], emit: LogFn) -
     return request_id
 
 
-def _trim_cell_leads(
-    leads: List[Dict[str, Any]],
-    cell_target: int,
-    market: str,
-    combo_code: Optional[str],
-    emit: LogFn,
-) -> List[Dict[str, Any]]:
-    """Never let a cell contribute more than its own target.
-
-    Without this, a cell whose search happened to surface more new (non-dup)
-    leads than it was asked for would hand ALL of them back, and the run's
-    total could exceed total_leads (seen in practice: target=46, 78 returned
-    and kept). A random sample avoids always favoring the same
-    fetch/dedup order.
-    """
-    if len(leads) <= cell_target:
-        return leads
-    emit(
-        f"[combo] market={market!r} code={combo_code!r} got {len(leads)} new "
-        f"leads, trimming to target {cell_target} (random sample) so the run "
-        "total doesn't exceed total_leads"
-    )
-    return random.sample(leads, cell_target)
-
-
 def _paginate_with_dedup(
     client: ApifyClient,
     request_id: str,
@@ -398,7 +406,7 @@ def _paginate_with_dedup(
         return new_leads, raw, last_page, False  # no budget left in this pass
 
     while True:
-        page_leads = _fetch_page(client, request_id, page, emit)
+        page_leads = _fetch_page(client, request_id, page, emit, market, combo_code)
         if not page_leads:
             return new_leads, raw, last_page, True  # confirmed: no more results
 
@@ -505,7 +513,12 @@ def _scrape_combo(
     session["raw_leads"] = raw
     session["last_page"] = last_page
     session["exhausted"] = exhausted
-    session["leads"] = _trim_cell_leads(new_leads, cell_target, market, combo_code, emit)
+    # No per-cell trim here: a combo contributes every new lead its own
+    # preliminary dedup found, even if that's more than cell_target. The final
+    # ceiling on total_leads is enforced once, globally, in job_runner after
+    # ICP scoring — keeping the highest-scoring leads across the whole run
+    # instead of arbitrarily discarding an over-performing combo's leads here.
+    session["leads"] = new_leads
     return session
 
 
@@ -749,16 +762,18 @@ def run_scraping(
     )
 
     def _absorb(leads: List[Dict[str, Any]], market: str, combo_code: Optional[str]) -> int:
-        # Shared by the main pass and the retry pass below: only genuinely new
-        # (not-yet-seen) leads count, and the run-wide total_leads cap is
-        # enforced here too as a last line of defense (cell targets are sized
-        # to sum to at most total_leads, so this shouldn't normally trigger).
+        # Shared by the main pass and the retry pass below. Only genuinely new
+        # (not-yet-seen-this-run) leads count — but deliberately NO total_leads
+        # cap here: a combo keeps every new lead its own preliminary dedup
+        # found, even past its own target. run_scraping's returned total can
+        # exceed total_leads; job_runner enforces that ceiling once, globally,
+        # after ICP scoring — keeping the highest-scoring leads across the
+        # whole run rather than discarding an over-performing combo's leads
+        # before their quality can even be compared.
         added = 0
         for lead in leads:
             if not isinstance(lead, dict):
                 continue
-            if len(all_leads) >= total_leads:
-                break
             linkedin_url = lead.get("linkedin_url")
             if not linkedin_url or linkedin_url in seen_linkedin_urls:
                 continue
@@ -771,9 +786,15 @@ def run_scraping(
         return added
 
     for index, combo in enumerate(cells):
-        if remaining <= 0:
-            break
-
+        # No early exit once remaining <= 0: an earlier combo overshooting its
+        # own target (no longer trimmed — see Change 1) can drive remaining
+        # negative, and stopping here would skip every later combo outright
+        # rather than let it run too. That would undermine the point of the
+        # global ICP trim below — combos never attempted can't contribute
+        # leads, however high-scoring they might have been. Once remaining
+        # is <= 0 the ceil-division formula naturally floors cell_target at
+        # 1 (a minimal ask), so every combo still gets a chance without
+        # aggressively over-fetching from ones that are already "satisfied".
         cells_left = len(cells) - index
         cell_target = max(-(-remaining // cells_left), 1)  # ceil division
         combo_code = combo.get("code") if isinstance(combo, dict) else None
@@ -856,9 +877,7 @@ def run_scraping(
             session["raw_leads"] = raw
             session["last_page"] = last_page
             session["exhausted"] = exhausted
-            session["leads"] = _trim_cell_leads(
-                new_leads, session["cell_target"], session["market"], session["combo_code"], emit
-            )
+            session["leads"] = new_leads  # no per-cell trim — see _scrape_combo
 
             added = _absorb(session["leads"], session["market"], session["combo_code"])
             emit(

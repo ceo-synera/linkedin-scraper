@@ -180,6 +180,23 @@ async def run_job(run_request: RunRequest) -> None:
             f"Scored: {scored_hot} HOT, {scored_warm} WARM, {scored_cold} COLD",
         )
 
+        # Combos no longer cap themselves individually (an over-performing
+        # combo keeps every lead it found), so the accumulated total can land
+        # above total_leads. Enforce the ceiling once, globally, here — keep
+        # the highest-ICP leads across the whole run rather than discarding
+        # whichever combo happened to over-deliver. score_leads already
+        # returns leads sorted by icp_score descending, so this is a slice,
+        # not a re-sort.
+        if len(scored_leads) > run_request.total_leads:
+            excess = len(scored_leads) - run_request.total_leads
+            scored_leads = scored_leads[: run_request.total_leads]
+            await _log(
+                run_id,
+                "info",
+                f"Trimmed {excess} lowest-ICP leads to stay within "
+                f"{run_request.total_leads} requested",
+            )
+
         await _log(run_id, "info", "Checking for duplicates...")
         new_leads, duplicates_count = await asyncio.to_thread(
             dedup_leads, scored_leads, organization_id
