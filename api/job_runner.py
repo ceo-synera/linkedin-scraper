@@ -158,6 +158,7 @@ async def run_job(run_request: RunRequest) -> None:
             combos,
             run_request.markets,
             run_request.total_leads,
+            organization_id,
             log_fn=lambda msg: log_run(run_id, "info", msg),
         )
         await _log(run_id, "info", f"Received {len(raw_leads)} raw leads from Apify")

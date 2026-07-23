@@ -5,6 +5,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from apify_client import ApifyClient
 
+# NOTE: this crosses the scraper/api boundary — scraper/ is otherwise
+# Apify-only (no DB, no secrets persisted). It's needed here so a combo can
+# check, page by page, whether Apify's results are actually new-to-DB before
+# deciding to fetch another page (see _scrape_combo). This preliminary dedup
+# only informs the pagination decision; job_runner's final dedup_leads call
+# on the full scored batch remains the authoritative one that determines
+# what's actually stored.
+from api.dedup import dedup_leads
+
 log = logging.getLogger(__name__)
 
 # Callback used to emit debug output. job_runner passes a callback that writes
@@ -44,6 +53,16 @@ PAGE_SIZE = 100
 INIT_WAIT_SECONDS = 10
 PROCESSING_POLL_SECONDS = 10
 MAX_PROCESSING_RETRIES = 30  # 30 * 10s = 5 minutes
+
+# Ask Apify for more than actually requested, to leave margin against
+# expected DB dedup losses (the actor tends to resurface the same top
+# profiles for a given filter set once they're already stored).
+OVERFETCH_MULTIPLIER = 1.7
+
+# Backfill cap: how many total pages (not extra pages — total, including
+# page 1) a single combo will fetch while trying to reach its requested
+# new-lead count via the preliminary per-page DB dedup check.
+MAX_COMBO_PAGES = 3
 
 # The actor only accepts these exact company-headcount range labels.
 ALLOWED_COMPANY_HEADCOUNTS = {
@@ -281,9 +300,21 @@ def _scrape_combo(
     client: ApifyClient,
     combo: Dict[str, Any],
     geo_codes: List[str],
-    leads_for_combo: int,
+    leads_requested: int,
+    organization_id: str,
+    market: str,
+    combo_code: Optional[str],
     emit: LogFn,
 ) -> List[Dict[str, Any]]:
+    # Overfetch: ask Apify for more than leads_requested, so there's margin
+    # left once already-scraped/already-stored profiles get filtered out by
+    # the DB dedup check below.
+    leads_to_fetch = int(leads_requested * OVERFETCH_MULTIPLIER)
+    emit(
+        f"[combo] market={market!r} code={combo_code!r} "
+        f"requested={leads_requested} fetching={leads_to_fetch}"
+    )
+
     # Flow 1 — init search.
     init_input = {
         "title_keywords": combo.get("title_keywords", []),
@@ -295,15 +326,56 @@ def _scrape_combo(
         "seniority_levels": _normalize_seniority_levels(
             combo.get("seniority_levels", []), emit
         ),
-        "limit": leads_for_combo,
+        "limit": leads_to_fetch,
     }
     emit(f"[Flow 1 init] input: {_dump(init_input)}")
 
+    # Flow 1 (_init_search) runs exactly once here, so its one-time 5-10 min
+    # wait only ever happens once per combo. Every extra page below reuses
+    # this same request_id through Flow 2 (_fetch_page) — Apify already has
+    # the results computed internally, so re-requesting a page is a matter of
+    # seconds, not a new long wait.
     request_id = _init_search(client, init_input, emit)
     if not request_id:
         return []
 
-    return _paginate(client, request_id, leads_for_combo, emit)
+    # Flow 2 — fetch pages, running a preliminary DB dedup after each page to
+    # decide whether fetching another page is worth it. This dedup only
+    # drives the pagination decision here; job_runner's dedup_leads on the
+    # full scored batch remains the authoritative check before storing.
+    all_page_leads: List[Dict[str, Any]] = []
+    new_leads: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        page_leads = _fetch_page(client, request_id, page, emit)
+        if not page_leads:
+            break  # gave up waiting on "processing", or truly zero results
+
+        all_page_leads.extend(page_leads)
+        new_leads, _duplicates = dedup_leads(all_page_leads, organization_id)
+        new_count = len(new_leads)
+
+        if new_count >= leads_requested:
+            break  # dedup already left us with enough new leads
+
+        if len(page_leads) < PAGE_SIZE:
+            break  # actor signaled this was the last available page
+
+        if page >= MAX_COMBO_PAGES:
+            emit(
+                f"[combo] market={market!r} code={combo_code!r} reached max "
+                f"pages ({MAX_COMBO_PAGES}), got {new_count}/{leads_requested} "
+                "new leads"
+            )
+            break
+
+        emit(
+            f"[combo] market={market!r} code={combo_code!r} after page {page}: "
+            f"{new_count} new leads (need {leads_requested}), fetching page {page + 1}"
+        )
+        page += 1
+
+    return new_leads
 
 
 # BD Group (company-seed) search is a genuinely different input shape from
@@ -418,6 +490,7 @@ def run_scraping(
     combos: List[Dict[str, Any]],
     markets: List[str],
     total_leads: int,
+    organization_id: str,
     log_fn: Optional[LogFn] = None,
 ) -> List[Dict[str, Any]]:
     emit: LogFn = log_fn or log.info
@@ -431,10 +504,12 @@ def run_scraping(
 
     # Flatten (market, combo) into cells and give each a dynamic target of the
     # remaining shortfall spread over the cells still to come. A combo that
-    # returns fewer real matches than its share leaves `remaining` high, so
-    # later cells automatically pick up the slack — instead of the old fixed
-    # per-combo cap that could never recover an under-delivering combo. Only
-    # leads actually added (after within-run dedup) count toward the target.
+    # returns fewer real matches than its share (now measured post-DB-dedup,
+    # see _scrape_combo's overfetch + pagination backfill) leaves `remaining`
+    # high, so later cells automatically pick up the slack — instead of the
+    # old fixed per-combo cap that could never recover an under-delivering
+    # combo. Only leads actually added (after this run's own dedup, on top of
+    # the DB dedup _scrape_combo already applied) count toward the target.
     cells = [(market, combo) for market in markets for combo in (combos or [{}])]
     remaining = total_leads
 
@@ -450,7 +525,9 @@ def run_scraping(
             f"[combo] market={market!r} code={combo_code!r} "
             f"target={cell_target} remaining={remaining}"
         )
-        combo_leads = _scrape_combo(client, combo, geo_codes, cell_target, emit)
+        combo_leads = _scrape_combo(
+            client, combo, geo_codes, cell_target, organization_id, market, combo_code, emit
+        )
 
         added = 0
         for lead in combo_leads:
