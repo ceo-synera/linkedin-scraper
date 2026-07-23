@@ -8,6 +8,16 @@ from api.models import SdrAssignment
 def distribute_leads(
     leads: List[Dict[str, Any]], sdr_assignments: List[SdrAssignment]
 ) -> Dict[str, List[Dict[str, Any]]]:
+    # The CRM now always sends exactly one SdrAssignment per run (SDRs no
+    # longer have Scraper access; only the org admin runs it, for that one
+    # SDR). With a single guaranteed recipient, market-based routing serves no
+    # purpose and only risks orphaning leads whose market isn't covered by
+    # assigned_markets (or doesn't match its casing) — give that SDR 100% of
+    # the leads directly. The market-routing path below is kept as a fallback
+    # in case multiple assignments are ever sent again.
+    if len(sdr_assignments) == 1:
+        return {sdr_assignments[0].sdr_id: list(leads)}
+
     distribution: Dict[str, List[Dict[str, Any]]] = {
         assignment.sdr_id: [] for assignment in sdr_assignments
     }
