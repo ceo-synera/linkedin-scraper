@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - defensive against client layout change
 # only informs the pagination decision; job_runner's final dedup_leads call
 # on the full scored batch remains the authoritative one that determines
 # what's actually stored.
+from api.config_generator import MarketNotFoundError, get_market_geo_code
 from api.dedup import dedup_leads
 
 log = logging.getLogger(__name__)
@@ -36,18 +37,10 @@ def _dump(value: Any) -> str:
 
 ACTOR_ID = "bestscrapers/sales-navigator-scraper-by-filters"
 
-GEO_CODES: Dict[str, List[str]] = {
-    "taiwan": ["104187078"],
-    "latam": [
-        "103323778",
-        "100446943",
-        "100877388",
-        "104621616",
-        "102927786",
-    ],
-    "vietnam": ["104195383"],
-    "global": [],
-}
+# Markets are no longer a hardcoded dict — they live in the `markets` table so
+# an org can pick from real countries and adding one takes no code change. One
+# market is now one country with one geo code; the old "latam" meta-market that
+# bundled several countries is gone.
 
 # The actor runs as two flows. Flow 1 (init search) is called with the
 # filters and returns a request_id. Flow 2 (fetch results) is called with
@@ -594,6 +587,18 @@ def run_scraping(
     # old fixed per-combo cap that could never recover an under-delivering
     # combo. Only leads actually added (after this run's own dedup, on top of
     # the DB dedup _scrape_combo already applied) count toward the target.
+    # Resolve every market's geo code up front, so an unknown market fails the
+    # run immediately with a clear message — before spending a single Apify
+    # call — instead of silently scraping with no geo filter, which is exactly
+    # how the "Spain in LATAM" bug went unnoticed.
+    geo_code_by_market: Dict[str, int] = {}
+    for market in markets:
+        geo_code = get_market_geo_code(market)
+        if geo_code is None:
+            raise MarketNotFoundError(f"Market '{market}' not found in markets table")
+        geo_code_by_market[market] = geo_code
+        emit(f"[market] {market!r} -> geo_code={geo_code}")
+
     cells = [(market, combo) for market in markets for combo in (combos or [{}])]
     remaining = total_leads
 
@@ -603,7 +608,7 @@ def run_scraping(
 
         cells_left = len(cells) - index
         cell_target = max(-(-remaining // cells_left), 1)  # ceil division
-        geo_codes = GEO_CODES.get(market.lower(), [])
+        geo_codes = [geo_code_by_market[market]]
         combo_code = combo.get("code") if isinstance(combo, dict) else None
         emit(
             f"[combo] market={market!r} code={combo_code!r} "

@@ -102,12 +102,19 @@ values`, revisar si conviene agregar ese alias en vez de perder el filtro.
 ### `geo_codes`
 
 - Deben ser **enteros** (`"Field input.geo_codes.0 must be integer"` si son
-  strings). Se guardan como strings en `GEO_CODES` y se castean con `int()`.
-- El lookup por mercado es **case-insensitive** (`GEO_CODES.get(market.lower())`):
-  los mercados llegan como `"LATAM"`/`"Taiwan"` y las claves son minúsculas. Si
-  no calza se manda `geo_codes: []` = **sin filtro geográfico** (bug que metía
-  perfiles de fuera de la región).
-- **España (`105646813`) NO es LATAM** y fue removida de esa lista.
+  strings).
+- **Ya no hay dict `GEO_CODES` hardcodeado.** Los mercados viven en la tabla
+  `markets` (`name`, `geo_code`, `region`, `default_language`, `is_active`) y se
+  resuelven con `get_market_geo_code(name)`, con match **case-insensitive**
+  (`ilike`).
+- **Un mercado = un país = un geo code.** El viejo meta-mercado `"latam"`, que
+  agrupaba 6 países en una entrada, ya no existe: ahora la org elige México,
+  Brasil, Argentina… por separado. Eso también elimina de raíz el bug de
+  "España en LATAM".
+- **Un mercado desconocido corta el run** con `MarketNotFoundError: Market 'X'
+  not found in markets table`, resuelto **antes** de gastar llamadas a Apify. El
+  comportamiento anterior era devolver `geo_codes: []` = sin filtro geográfico,
+  que pasaba desapercibido.
 
 ### `functions` ya no se manda
 

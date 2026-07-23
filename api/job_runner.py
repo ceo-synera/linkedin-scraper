@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from api.config_generator import (
     get_combo_definitions,
+    get_market_languages,
     get_sender_profile,
 )
 from api.database import get_supabase, log_run, update_run_status
@@ -225,6 +226,12 @@ async def run_job(run_request: RunRequest) -> None:
                 "Generating personalized messages (this may take a moment)...",
             )
 
+        # Resolve the run's market languages once, not once per lead — a lookup
+        # inside message generation would mean a DB round trip per message.
+        market_languages = await asyncio.to_thread(
+            get_market_languages, run_request.markets
+        )
+
         for sdr_id, sdr_leads in distribution.items():
             if not sdr_leads:
                 continue
@@ -255,6 +262,7 @@ async def run_job(run_request: RunRequest) -> None:
                 run_request.anthropic_model,
                 market=sdr_market,
                 company_context=run_request.company_context,
+                market_languages=market_languages,
                 log_fn=lambda msg: log_run(run_id, "info", msg),
             )
 

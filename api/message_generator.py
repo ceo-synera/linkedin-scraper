@@ -28,27 +28,36 @@ MESSAGE_MAX_TOKENS = 2048
 
 DEFAULT_LANGUAGE = "en"
 
-# Default outreach language per market, used when there's no sender profile
-# (Basic) or the profile language is the default.
-MARKET_LANGUAGE = {
-    "taiwan": "zh",
-    "latam": "es",
-    "vietnam": "vi",
-    "global": "en",
-}
-
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _resolve_language(
-    language: str, market: Optional[str], sender_profile: Optional[SenderProfile]
+    language: str,
+    market: Optional[str],
+    sender_profile: Optional[SenderProfile],
+    market_languages: Optional[Dict[str, str]] = None,
 ) -> str:
-    # A profile with an explicitly non-default language wins. Otherwise (Basic,
-    # or a profile still on the default language) fall back to the market's
-    # language instead of always defaulting to English.
+    """Language for one lead's message.
+
+    A profile with an explicitly non-default language wins. Otherwise (Basic,
+    or a profile still on the default language) fall back to the market's
+    language instead of always defaulting to English.
+
+    market_languages comes from the `markets` table, resolved once per run by
+    the caller — looking it up per lead would mean a DB round trip for every
+    single message.
+    """
     if sender_profile is not None and language and language != DEFAULT_LANGUAGE:
         return language
-    return MARKET_LANGUAGE.get((market or "").lower(), DEFAULT_LANGUAGE)
+
+    if not market_languages:
+        return DEFAULT_LANGUAGE
+
+    market_key = (market or "").lower()
+    for name, market_language in market_languages.items():
+        if (name or "").lower() == market_key:
+            return market_language or DEFAULT_LANGUAGE
+    return DEFAULT_LANGUAGE
 
 
 def _resolve_char_limits(sender_profile: Optional[SenderProfile]) -> Tuple[int, int]:
@@ -243,6 +252,7 @@ async def generate_messages_for_batch(
     anthropic_model: str,
     market: Optional[str] = None,
     company_context: str = "",
+    market_languages: Optional[Dict[str, str]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
     if not leads:
@@ -254,7 +264,9 @@ async def generate_messages_for_batch(
         # Resolve language per lead: a batch can span markets when an SDR
         # covers several. Fall back to the batch-level market parameter.
         lead_market = lead.get("market") or market
-        effective_language = _resolve_language(language, lead_market, sender_profile)
+        effective_language = _resolve_language(
+            language, lead_market, sender_profile, market_languages
+        )
         return _build_prompt(
             lead,
             plan,

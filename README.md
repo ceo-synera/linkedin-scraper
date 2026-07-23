@@ -130,6 +130,8 @@ No está confirmado que el actor acepte ese campo, y el actor rechaza el **input
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/health` | Health check |
+| GET | `/markets` | Mercados activos, agrupados por región |
+| GET | `/organizations/{organization_id}/markets` | Mercados habilitados de una org |
 | POST | `/runs` | Inicia un run (la fila debe existir en `runs` con status `pending`) |
 | GET | `/runs/{run_id}` | Estado del run |
 | GET | `/runs/{run_id}/logs` | Logs del run |
@@ -222,6 +224,8 @@ Railway marca como `error` todo lo que sale por **stderr**. Como el logging defa
 | `scraper_leads` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `first_name`, `last_name`, `company`, `title`, `location`, `icp_score`, `search_combo`, `custom1`, `custom2`, `market`, `exported_to_crm`, `created_at`. **No tiene `email`.** |
 | `prospects` | Solo se **lee** para dedup (`linkedin_url`). El insert lo hace el CRM. |
 | `monthly_lead_counts` | `organization_id`, **`year_month`** (`"YYYY-MM"`), **`count`** |
+| `markets` | `id`, `name` (UNIQUE), `geo_code`, `region` (`asia`/`latin_america`/`europe`/`usa`), `default_language`, `is_active` |
+| `organization_markets` | `organization_id`, `market_id` (UNIQUE juntos) |
 | `bridge_seed_lists` | `id`, `organization_id`, `name`, `channel_family`, `company_names[]`, `industry_codes[]`, `company_headcounts[]`, `geo_codes[]` |
 | `bridge_runs` | `id`, `organization_id`, `seed_list_id`, `status`, `total_candidates`, `error_message`, `started_at`, `completed_at` |
 | `bridge_run_logs` | `run_id`, `level`, `message`, `created_at` |
@@ -257,7 +261,7 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-08 | `org_combos` se filtraba por `enabled` | La columna real es `is_active` |
 | 2026-07-08 | `scraper_combos_master` se filtraba por `combo_code` | La columna real es `code` |
 | 2026-07-20 | El código leía `status` en la respuesta del actor; la señal real es `message == "ok"` | Se descartaban leads válidos. Corregido |
-| 2026-07-20 | `GEO_CODES.get(market)` fallaba con `"LATAM"` (claves en minúscula) → sin filtro geográfico | `market.lower()` |
+| 2026-07-20 | `GEO_CODES.get(market)` fallaba con `"LATAM"` (claves en minúscula) → sin filtro geográfico | `market.lower()`; luego reemplazado por la tabla `markets` |
 | 2026-07-20 | El actor exige `geo_codes` **enteros** | `int()` al construir el input |
 | 2026-07-20 | España (`105646813`) estaba en la lista `latam` | Removida |
 | 2026-07-20 | `scraper_leads` no tiene columna `email` → `PGRST204` | Fuera del insert |

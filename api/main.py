@@ -13,6 +13,7 @@ from api.bridge_models import (
     BridgeRunRequest,
     BridgeSeedListInput,
 )
+from api.config_generator import list_markets, list_organization_markets
 from api.database import get_supabase
 from api.job_runner import run_job
 from api.models import RunRequest
@@ -104,6 +105,36 @@ def _fetch_run_logs(run_id: str) -> Any:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok", "version": "1.0.0"}
+
+
+@app.get("/markets")
+async def get_markets() -> Dict[str, Any]:
+    """All active markets, grouped by region."""
+    markets = await asyncio.to_thread(list_markets)
+
+    grouped: Dict[str, Any] = {}
+    for market in markets:
+        grouped.setdefault(market["region"], []).append(
+            {
+                "id": market["id"],
+                "name": market["name"],
+                "geo_code": market["geo_code"],
+                "default_language": market["default_language"],
+            }
+        )
+    return grouped
+
+
+@app.get("/organizations/{organization_id}/markets")
+async def get_organization_markets(organization_id: str) -> Dict[str, Any]:
+    """Markets an organization has enabled.
+
+    Scoped by organization_id in the query's WHERE clause, so it can only ever
+    return that org's rows. Note this service has no user session to check the
+    caller against — see the multi-tenant section of the README.
+    """
+    markets = await asyncio.to_thread(list_organization_markets, organization_id)
+    return {"organization_id": organization_id, "markets": markets}
 
 
 @app.post("/runs")
