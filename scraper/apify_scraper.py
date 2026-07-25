@@ -252,9 +252,51 @@ def _map_lead(item: Dict[str, Any]) -> Dict[str, Any]:
 
 # If the actor's "processing" message (e.g. a "Done X/Y" progress indicator)
 # comes back byte-for-byte identical this many attempts in a row, the search
-# isn't making progress — stop polling this page instead of burning through
-# all MAX_PROCESSING_RETRIES attempts waiting for a change that isn't coming.
-STALL_LIMIT = 3
+# probably isn't making progress. Set generously: the actor can take several
+# ~14s poll cycles between progress increments without being stuck, and a run
+# was aborted at "Done 49/100" simply because Apify was slow between bumps.
+# 8 * ~14s ≈ ~110s of genuine no-change before we suspect a real stall — long
+# enough to tell "slow" from "stuck" (was 3 ≈ 42s, too twitchy).
+STALL_LIMIT = 8
+
+# When a stall is finally suspected, wait this much longer once more and refetch
+# before giving up. The actor only returns leads once the whole search flips to
+# "ok" — a processing response carries no partial data to salvage — so this last,
+# longer window is the only way to recover an almost-finished search's results
+# (e.g. one sitting at "Done 100/100" about to flip). If it's genuinely stuck
+# this costs one extra wait, not the full MAX_PROCESSING_RETRIES.
+STALL_GRACE_SECONDS = 45
+
+
+def _try_fetch_once(
+    client: ApifyClient, request_id: str, page: int, emit: LogFn
+) -> Tuple[Optional[List[Dict[str, Any]]], Any]:
+    """One Flow 2 fetch. Returns (leads, message).
+
+    leads is the mapped list when the search is ready ("ok" / a `data` list),
+    or None while still processing — in which case `message` holds the actor's
+    progress text so the caller can detect a stall.
+    """
+    items = _call_actor(client, {"request_id": request_id, "page": page})
+    response = _first_dict(items)
+    # The actor signals readiness via `message` ("ok"), not `status`, and
+    # returns the leads under `data`. While still running it returns a
+    # non-"ok" message and no `data` list (no partial data to grab).
+    message = response.get("message")
+    data = response.get("data")
+    ready = isinstance(data, list) or (
+        isinstance(message, str) and message.strip().lower() == "ok"
+    )
+    emit(
+        f"[Flow 2 fetch] page {page} message={message!r} "
+        f"data items={len(data) if isinstance(data, list) else 0}"
+    )
+    if ready:
+        rows = data if isinstance(data, list) else []
+        leads = [_map_lead(item) for item in rows if isinstance(item, dict)]
+        emit(f"[Flow 2 fetch] page {page} ok: {len(leads)} mapped leads")
+        return leads, message
+    return None, message
 
 
 def _fetch_page(
@@ -268,51 +310,46 @@ def _fetch_page(
     # Returns the mapped leads for the page, an empty list when the page has
     # no results, or None when the actor never stopped "processing" (either it
     # exhausted MAX_PROCESSING_RETRIES, or it stalled — see STALL_LIMIT).
+    def _stall_label() -> str:
+        if market is not None or combo_code is not None:
+            return f"[combo] market={market!r} code={combo_code!r}"
+        return f"[Flow 2 fetch] page {page}"
+
     last_message: Any = object()  # sentinel that can't equal a real message
     stall_count = 0
 
     for attempt in range(MAX_PROCESSING_RETRIES):
-        fetch_input = {"request_id": request_id, "page": page}
         emit(
             f"[Flow 2 fetch] attempt {attempt + 1}/{MAX_PROCESSING_RETRIES} "
-            f"input: {_dump(fetch_input)}"
+            f"input: {_dump({'request_id': request_id, 'page': page})}"
         )
-        items = _call_actor(client, fetch_input)
-        response = _first_dict(items)
-        # The actor signals readiness via `message` ("ok"), not `status`, and
-        # returns the leads under `data`. While the search is still running it
-        # returns a non-"ok" message and no `data` list.
-        message = response.get("message")
-        data = response.get("data")
-        ready = isinstance(data, list) or (
-            isinstance(message, str) and message.strip().lower() == "ok"
-        )
-        emit(
-            f"[Flow 2 fetch] page {page} message={message!r} "
-            f"data items={len(data) if isinstance(data, list) else 0}"
-        )
-
-        if ready:
-            rows = data if isinstance(data, list) else []
-            leads = [_map_lead(item) for item in rows if isinstance(item, dict)]
-            emit(f"[Flow 2 fetch] page {page} ok: {len(leads)} mapped leads")
+        leads, message = _try_fetch_once(client, request_id, page, emit)
+        if leads is not None:
             return leads
 
         stall_count = stall_count + 1 if message == last_message else 1
         last_message = message
 
         if stall_count >= STALL_LIMIT:
-            if market is not None or combo_code is not None:
-                emit(
-                    f"[combo] market={market!r} code={combo_code!r} stalled at "
-                    f"{message!r} for {STALL_LIMIT} consecutive attempts, giving "
-                    "up on this combo early"
-                )
-            else:
-                emit(
-                    f"[Flow 2 fetch] page {page} stalled at {message!r} for "
-                    f"{STALL_LIMIT} consecutive attempts, giving up early"
-                )
+            # One last, longer grace window before giving up — the only way to
+            # recover an almost-done search, since there are no partial results
+            # in a processing response.
+            emit(
+                f"{_stall_label()} stalled at {message!r} for {STALL_LIMIT} "
+                f"consecutive attempts; waiting {STALL_GRACE_SECONDS}s for a "
+                "final grace attempt before giving up"
+            )
+            time.sleep(STALL_GRACE_SECONDS)
+            leads, message = _try_fetch_once(client, request_id, page, emit)
+            if leads is not None:
+                emit(f"{_stall_label()} recovered {len(leads)} leads on the grace attempt")
+                return leads
+
+            emit(
+                f"{_stall_label()} still stalled at {message!r} after the grace "
+                "attempt (the actor returns no partial data mid-search); giving "
+                "up on this search early"
+            )
             return None
 
         emit(
