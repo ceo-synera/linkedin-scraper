@@ -78,7 +78,7 @@ El CRM puede mandar varios países de la misma región (ej. `markets: ["Argentin
 
 - **Todos los países de un run deben compartir región.** Mezclar regiones (`["Argentina", "Taiwan"]`) lanza `MixedRegionMarketsError` antes de gastar ninguna llamada a Apify.
 - El actor no dice de qué país vino cada lead. Con 1 país, `lead["market"]` guarda ese país tal cual. Con varios, guarda el **nombre de la región** (`"Latin America"`).
-- El idioma de los mensajes usa un campo aparte (`language_market`), tomado del **primer país de la lista** — necesario porque el idioma se busca por nombre de país real, y `"Latin America"` no matchearía nada. Es una elección documentada, no una garantía: si la región mezcla idiomas, los leads de los demás países pueden salir en el idioma equivocado.
+- El idioma de los mensajes usa un campo aparte (`language_market`), porque el idioma se busca por nombre de país real y `"Latin America"` no matchearía nada. Se intenta resolver **por lead individual**: `_detect_market_from_location` busca, dentro del `location` en texto libre que trae el actor (ej. `"Taipei, Taiwan"`), una coincidencia por substring case-insensitive contra los países de *este* run (no toda la tabla `markets`, ya que el lead solo puede ser de uno de los países realmente buscados). Si matchea, ese lead usa el idioma de su propio país; si no (texto ambiguo, vacío, o sin match), cae al **primer país de la lista** como fallback. Se loguea cuántos leads se resolvieron de cada forma: `"Language resolution: N leads resolved by location, M used region fallback"`. Con 1 solo país no hay ambigüedad que resolver — el comportamiento es idéntico al de antes, sin heurística ni log.
 
 ### `prospects` lo inserta el CRM, no este backend
 
@@ -210,6 +210,16 @@ Reglas que se siguen en todo el código:
 - `anthropic_base_url` — default `https://api.anthropic.com`; se puede apuntar a un proxy custom (p. ej. AITokenKing). **Si termina en `/v1` se le recorta**, porque el SDK de Anthropic agrega `/v1` por su cuenta y quedaría `/v1/v1`.
 - `anthropic_model` — se pasa **exactamente como viene**, sin normalizar. Ojo: los proxies tienen su propia nomenclatura; AITokenKing, por ejemplo, no acepta los IDs oficiales de Anthropic. Consultá su `/models` para ver la lista real.
 
+### Chino: simplificado vs. tradicional
+
+Un código `"zh"` a secas es ambiguo para Claude entre script simplificado y tradicional — probado en producción, por defecto genera **simplificado**, que se lee como chino continental y es un error notorio para Taiwan/Hong Kong. `_language_instruction()` en `message_generator.py` traduce el código a una instrucción explícita antes de armar el prompt (`"zh-TW"` → *"Traditional Chinese (繁體中文), as used in Taiwan"*, `"zh-CN"` → *"Simplified Chinese (简体中文)..."*; un `"zh"` a secas que aún llegue se resuelve a simplificado, igual que el default observado). El resto de los idiomas (`es`, `vi`, `pt`, `ja`...) pasa sin tocar — no se observó una ambigüedad equivalente.
+
+Esto depende de que `markets.default_language` sea explícito para Taiwan/Hong Kong/China, no un `"zh"` genérico:
+```sql
+UPDATE markets SET default_language = 'zh-TW' WHERE name IN ('Taiwan', 'Hong Kong');
+UPDATE markets SET default_language = 'zh-CN' WHERE name = 'China';
+```
+
 ### Generación en paralelo
 
 Los mensajes se generan **concurrentemente** con `anthropic.AsyncAnthropic` + `asyncio.gather`, acotados por `asyncio.Semaphore(MESSAGE_CONCURRENCY = 6)`. Antes era secuencial (~5 s por lead), y 90 leads tardaban ~8 min, provocando 504 en el polling del CRM. Con 6 en paralelo baja a ~80 s. Verificado que el proxy de AITokenKing responde 200 (sin 429) con 6 concurrentes; si aparecieran 429, bajar esa constante a 3-4.
@@ -318,6 +328,8 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-24 | Una celda con pool abundante aportaba más leads de los que le tocaban (target=46, sumó 78) → runs terminaban por encima de `total_leads` | Se recorta cada celda a su target exacto (muestra aleatoria); `OVERFETCH_MULTIPLIER` bajado a 1.2; chequeo de 80% con una ronda de reintento acotada |
 | 2026-07-24 | El recorte por celda descartaba leads de un combo que rendía bien en vez de compararlo contra el resto; el polling podía tardar 5 min en un combo estancado | Revertido a "cada combo aporta todo"; recorte final único por ICP score en `job_runner`; corte de estancamiento a 3 intentos sin cambio de mensaje |
 | 2026-07-25 | El corte de estancamiento a 3 intentos abortaba búsquedas lentas-pero-avanzando (Bridge: `Done 49/100` → 0 candidatos, descartando los 49) | `STALL_LIMIT` 3→8; intento de gracia final (45s) que rescata la búsqueda si completa; confirmado que el actor no expone parciales mid-search |
+| 2026-07-26 | Todos los leads de un run multi-país recibían el idioma del primer país de la lista, sin importar su país real | `_detect_market_from_location`: heurística por `location` del lead, con fallback documentado |
+| 2026-07-26 | Mensajes para Taiwan salían en chino simplificado (debían ser tradicional) — `"zh"` a secas es ambiguo para Claude | `_language_instruction()` explicita "Traditional Chinese"/"Simplified Chinese" en el prompt; `default_language` de Taiwan/HK/China debe ser `zh-TW`/`zh-CN` en la tabla `markets` |
 | 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
 
 ## Verificación

@@ -28,6 +28,30 @@ MESSAGE_MAX_TOKENS = 2048
 
 DEFAULT_LANGUAGE = "en"
 
+# Bare "zh" is genuinely ambiguous to Claude between Simplified and
+# Traditional script. Testing confirmed it defaults to Simplified — a
+# notorious mismatch for Taiwan/Hong Kong, which read as mainland Chinese.
+# markets.default_language should be the explicit 'zh-TW' / 'zh-CN' for those
+# countries (see migration in HANDOFF.md), but this mapping also covers any
+# sender_profile.language still set to a bare/ambiguous code. Every other
+# language code passes through unchanged — no equivalent ambiguity has been
+# observed for Spanish, Vietnamese, Portuguese, etc.
+_CHINESE_VARIANT_INSTRUCTIONS = {
+    "zh-tw": "Traditional Chinese (繁體中文), as used in Taiwan",
+    "zh-hk": "Traditional Chinese (繁體中文), as used in Hong Kong",
+    "zh-hant": "Traditional Chinese (繁體中文)",
+    "zh-cn": "Simplified Chinese (简体中文), as used in mainland China",
+    "zh-hans": "Simplified Chinese (简体中文)",
+    # Bare "zh" kept explicit rather than left ambiguous, matching the
+    # behavior Claude was already defaulting to before this fix.
+    "zh": "Simplified Chinese (简体中文)",
+}
+
+
+def _language_instruction(language: str) -> str:
+    return _CHINESE_VARIANT_INSTRUCTIONS.get((language or "").strip().lower(), language)
+
+
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -120,10 +144,11 @@ def _build_prompt(
     lead_name = lead.get("full_name") or lead.get("name") or "the prospect"
     lead_title = lead.get("title") or lead.get("job_title") or ""
     lead_company = lead.get("company") or ""
+    language_instruction = _language_instruction(language)
 
     return f"""{sender_context}
 {company_context_block}
-Write two LinkedIn outreach messages in {language} for this prospect:
+Write two LinkedIn outreach messages in {language_instruction} for this prospect:
 - Name: {lead_name}
 - Title: {lead_title}
 - Company: {lead_company}

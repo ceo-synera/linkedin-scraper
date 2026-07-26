@@ -724,6 +724,32 @@ def run_bridge_scraping(
     return candidates
 
 
+def _detect_market_from_location(
+    location: Optional[str], candidate_markets: List[Dict[str, Any]]
+) -> Optional[str]:
+    """Best-effort country match from a lead's free-text `location`.
+
+    The actor never returns a lead's country structured — only this free-text
+    field (e.g. "Taipei, Taiwan", "Ho Chi Minh City, Vietnam"). Matching is a
+    case-insensitive substring check against the real country names of THIS
+    run's own resolved markets — not the whole markets table — since a lead
+    can only be from one of the countries actually searched (geo_codes already
+    restricted results to them), which also keeps the match space small enough
+    to avoid unrelated-country false positives.
+
+    Returns the matched market's exact name, or None if location is empty or
+    nothing matched — callers fall back to language_market in that case.
+    """
+    if not location:
+        return None
+    location_lower = location.lower()
+    for row in candidate_markets:
+        name = row.get("name") or ""
+        if name and name.lower() in location_lower:
+            return name
+    return None
+
+
 def run_scraping(
     apify_token: str,
     combos: List[Dict[str, Any]],
@@ -772,17 +798,18 @@ def run_scraping(
         language_market = markets[0]
     else:
         market_label = region_label(resolved_markets[0]["region"])
-        # Language can't be resolved per lead either. Using the first-listed
-        # market's language is a deliberate, documented choice, not a
-        # guarantee: if the selected countries don't share a language (e.g.
-        # combining Asian markets with different scripts), messages for
-        # leads actually from the other countries may come out in the wrong
-        # language. This only affects multi-country runs.
+        # The actor still doesn't return a lead's real country, but its
+        # free-text `location` is a best-effort signal — _absorb below tries
+        # to match it against this run's own countries per lead. The
+        # first-listed market's language remains the fallback for whatever
+        # doesn't match (ambiguous/empty location, or no match at all) — not
+        # a guarantee, but no longer the only option.
         language_market = markets[0]
         emit(
             f"[market] combined {markets!r} into region {market_label!r}, "
             f"geo_codes={combined_geo_codes} "
-            f"(message language will follow {language_market!r})"
+            f"(per-lead location will be checked; falling back to "
+            f"{language_market!r} when it can't be determined)"
         )
 
     for row in resolved_markets:
@@ -798,6 +825,13 @@ def run_scraping(
         (total_leads / len(cells)) * MAX_CELL_TARGET_MULTIPLIER
     )
 
+    # Only meaningful when several countries were combined — with one market
+    # language_market is already exactly right, so there's nothing to resolve
+    # per lead and no point running the heuristic or counting its hits.
+    resolve_language_per_lead = len(resolved_markets) > 1
+    location_matched_count = 0
+    location_fallback_count = 0
+
     def _absorb(leads: List[Dict[str, Any]], market: str, combo_code: Optional[str]) -> int:
         # Shared by the main pass and the retry pass below. Only genuinely new
         # (not-yet-seen-this-run) leads count — but deliberately NO total_leads
@@ -807,6 +841,7 @@ def run_scraping(
         # after ICP scoring — keeping the highest-scoring leads across the
         # whole run rather than discarding an over-performing combo's leads
         # before their quality can even be compared.
+        nonlocal location_matched_count, location_fallback_count
         added = 0
         for lead in leads:
             if not isinstance(lead, dict):
@@ -816,7 +851,20 @@ def run_scraping(
                 continue
             seen_linkedin_urls.add(linkedin_url)
             lead["market"] = market
-            lead["language_market"] = language_market
+
+            if resolve_language_per_lead:
+                detected = _detect_market_from_location(
+                    lead.get("location"), resolved_markets
+                )
+                if detected:
+                    lead["language_market"] = detected
+                    location_matched_count += 1
+                else:
+                    lead["language_market"] = language_market
+                    location_fallback_count += 1
+            else:
+                lead["language_market"] = language_market
+
             lead["combo"] = combo_code
             all_leads.append(lead)
             added += 1
@@ -931,5 +979,11 @@ def run_scraping(
                 f"Run finished below 80% threshold: {total_so_far} of {total_leads} "
                 f"requested ({percent}%) after retry attempt"
             )
+
+    if resolve_language_per_lead:
+        emit(
+            f"Language resolution: {location_matched_count} leads resolved by "
+            f"location, {location_fallback_count} used region fallback"
+        )
 
     return all_leads
