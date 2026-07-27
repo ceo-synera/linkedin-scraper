@@ -13,13 +13,15 @@ from fastapi.responses import JSONResponse
 from api.bridge_job_runner import run_bridge_job
 from api.bridge_models import (
     BridgeCandidateUpdate,
+    BridgeConfirmBatchRequest,
     BridgeRunRequest,
     BridgeSeedListInput,
 )
-from api.config_generator import list_markets, list_organization_markets
+from api.config_generator import get_sender_profile, list_markets, list_organization_markets
 from api.database import get_supabase
 from api.job_runner import run_job
-from api.models import RunRequest
+from api.message_generator import generate_messages_for_batch
+from api.models import RunRequest, SenderProfile
 
 # Send all logs to stdout (not the default stderr) so Railway doesn't tag every
 # normal INFO line as "error". force=True replaces any handler uvicorn set up.
@@ -319,6 +321,63 @@ def _bridge_fetch_candidate(candidate_id: str) -> Any:
     )
 
 
+def _bridge_fetch_pending_candidates(candidate_ids: list, organization_id: str) -> Any:
+    """Rows to confirm, scoped to this org and to still-pending status.
+
+    Ownership works the same way as get_bridge_seed_list: an id that belongs
+    to another org, or has already been confirmed/rejected, simply matches no
+    row here rather than erroring — a retried request can't double-bill a
+    candidate for message generation.
+    """
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_candidates")
+        .select("*")
+        .in_("id", candidate_ids)
+        .eq("organization_id", organization_id)
+        .eq("verification_status", "pending")
+        .execute()
+    )
+
+
+def _bridge_confirm_candidate(
+    candidate_id: str,
+    organization_id: str,
+    sdr_id: str,
+    custom1: Optional[str],
+    custom2: Optional[str],
+) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_candidates")
+        .update(
+            {
+                "verification_status": "confirmed",
+                "assigned_to": sdr_id,
+                "custom1": custom1,
+                "custom2": custom2,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", candidate_id)
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+
+def _candidate_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Add the `company` alias the CRM's BridgeCandidate type reads.
+
+    bridge_candidates stores the company under `company_name` (it doubles as
+    half of the dedup identity in bridge_job_runner.dedup_bridge_candidates),
+    but the CRM has only ever read `company` — so every candidate rendered
+    with no company name (QA-F26) even though the value was persisted
+    correctly all along.
+    """
+    row["company"] = row.get("company_name")
+    return row
+
+
 def _bridge_update_candidate_status(
     candidate_id: str, organization_id: str, verification_status: str
 ) -> Any:
@@ -414,7 +473,8 @@ async def get_bridge_run_logs(run_id: str, organization_id: str) -> Dict[str, An
 @app.get("/bridge/candidates")
 async def list_bridge_candidates(run_id: str, organization_id: str) -> Dict[str, Any]:
     res = await asyncio.to_thread(_bridge_list_candidates, run_id, organization_id)
-    return {"run_id": run_id, "organization_id": organization_id, "candidates": res.data}
+    candidates = [_candidate_public(row) for row in res.data]
+    return {"run_id": run_id, "organization_id": organization_id, "candidates": candidates}
 
 
 @app.patch("/bridge/candidates/{candidate_id}")
@@ -438,4 +498,72 @@ async def update_bridge_candidate(
     if not res.data:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    return res.data[0]
+    return _candidate_public(res.data[0])
+
+
+@app.post("/bridge/candidates/confirm-batch")
+async def confirm_bridge_candidates(
+    confirm_request: BridgeConfirmBatchRequest,
+) -> Dict[str, Any]:
+    """Confirm several candidates and generate their outreach messages.
+
+    Was missing entirely (QA-F27): the CRM has called this route since it
+    added the batch-confirm button, but this backend never defined it, so
+    every call 405'd. Message generation reuses
+    api.message_generator.generate_messages_for_batch — the same engine and
+    custom1/custom2 shape as the main lead pipeline.
+    """
+    if not confirm_request.candidate_ids:
+        return {"confirmed": 0, "candidates": []}
+
+    res = await asyncio.to_thread(
+        _bridge_fetch_pending_candidates,
+        confirm_request.candidate_ids,
+        confirm_request.organization_id,
+    )
+    candidates = res.data
+    if not candidates:
+        return {"confirmed": 0, "candidates": []}
+
+    sender_profile: Optional[SenderProfile] = None
+    if confirm_request.sender_profile_id:
+        sender_profile = await asyncio.to_thread(
+            get_sender_profile,
+            confirm_request.sender_profile_id,
+            confirm_request.organization_id,
+        )
+    language = sender_profile.language if sender_profile else "en"
+
+    # _candidate_public's `company` alias is what the prompt builder reads
+    # (lead.get("company")) — without it every generated message would see
+    # an empty company name, the same bug this endpoint's sibling fix covers.
+    leads = [_candidate_public(row) for row in candidates]
+
+    await generate_messages_for_batch(
+        leads,
+        confirm_request.anthropic_key,
+        # Bridge has no plan tiers of its own; anything other than "basic"
+        # keeps the sender-profile-driven personalization path in
+        # message_generator._build_sender_context.
+        "premium",
+        sender_profile,
+        language,
+        confirm_request.anthropic_base_url or "https://api.anthropic.com",
+        confirm_request.anthropic_model or "claude-sonnet-4-6",
+        company_context=confirm_request.bridge_context,
+    )
+
+    async def _confirm_one(lead: Dict[str, Any]) -> Dict[str, Any]:
+        res = await asyncio.to_thread(
+            _bridge_confirm_candidate,
+            lead["id"],
+            confirm_request.organization_id,
+            confirm_request.sdr_id,
+            lead.get("custom1"),
+            lead.get("custom2"),
+        )
+        return _candidate_public(res.data[0]) if res.data else lead
+
+    updated = await asyncio.gather(*(_confirm_one(lead) for lead in leads))
+
+    return {"confirmed": len(updated), "candidates": updated}

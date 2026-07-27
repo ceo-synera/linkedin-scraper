@@ -1,4 +1,4 @@
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -51,3 +51,24 @@ class BridgeCandidateUpdate(BaseModel):
 
     verification_status: VerificationStatus
     organization_id: str
+
+
+class BridgeConfirmBatchRequest(BaseModel):
+    """Confirm several candidates at once and generate their outreach messages.
+
+    Reuses api.message_generator.generate_messages_for_batch — the same
+    engine the main lead pipeline uses for custom1/custom2 — rather than a
+    second implementation. anthropic_base_url/anthropic_model are Optional
+    (not defaulted here) because the CRM proxy sends explicit `null` when the
+    org hasn't overridden them; a pydantic default wouldn't apply to an
+    explicit null, so the fallback is resolved in the endpoint instead.
+    """
+
+    organization_id: str
+    candidate_ids: List[str] = Field(default_factory=list)
+    sdr_id: str
+    sender_profile_id: Optional[str] = None
+    anthropic_key: str
+    anthropic_base_url: Optional[str] = None
+    anthropic_model: Optional[str] = None
+    bridge_context: str = ""

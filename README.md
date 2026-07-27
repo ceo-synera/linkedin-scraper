@@ -104,7 +104,7 @@ Clasificación: **HOT ≥ 70 / WARM 50-69 / COLD < 50**.
 
 ## Bridge (`api/bridge_job_runner.py`)
 
-Bridge busca contactos de partnerships dentro de empresas/industrias objetivo. **No genera mensajes de outreach** — solo descubre y organiza candidatos para revisión humana. Reemplaza por completo al viejo "BD Group", que fue eliminado.
+Bridge busca contactos de partnerships dentro de empresas/industrias objetivo y los deja para revisión humana. Reemplaza por completo al viejo "BD Group", que fue eliminado. El descubrimiento (este runner) no genera mensajes; eso pasa después, al confirmar candidatos en batch (`POST /bridge/candidates/confirm-batch`, ver más abajo).
 
 1. `update_bridge_run_status` → `running`
 2. `get_bridge_seed_list` — la seed list, filtrada por `organization_id` **y** `id`
@@ -140,6 +140,23 @@ No está confirmado que el actor acepte ese campo, y el actor rechaza el **input
 
 `dedup_bridge_candidates` consulta **solo** `bridge_candidates`, nunca `scraper_leads` ni `prospects`. La identidad es `(company_name, linkedin_url)`: la misma persona puede ser contacto de partnership para más de una empresa. Una persona puede ser legítimamente lead de venta **y** contacto de partnership, y esos pipelines no deben filtrarse entre sí.
 
+### Confirmar candidatos y generar mensajes (`POST /bridge/candidates/confirm-batch`)
+
+Reutiliza `api.message_generator.generate_messages_for_batch` — el mismo motor que usa el pipeline principal de Leads — en vez de duplicar la lógica de llamada a Claude. Recibe `candidate_ids`, `sdr_id`, `sender_profile_id` (opcional), y las credenciales de Anthropic de la organización (inyectadas por el CRM, nunca por el browser). Por cada candidato **todavía `pending`** y de esta organización (los que no matchean esas dos condiciones se ignoran en silencio, mismo criterio que el resto de Bridge): genera `custom1`/`custom2` y marca `verification_status='confirmed'` + `assigned_to=sdr_id`.
+
+Bridge no tiene niveles de plan propios; se le pasa `"premium"` a `generate_messages_for_batch` para siempre tomar el camino personalizado por `sender_profile` (ver `_build_sender_context`).
+
+> ⚠️ **Requiere columnas nuevas en `bridge_candidates`:** `assigned_to`, `custom1`, `custom2`. Correr antes de desplegar:
+> ```sql
+> ALTER TABLE bridge_candidates ADD COLUMN IF NOT EXISTS assigned_to text;
+> ALTER TABLE bridge_candidates ADD COLUMN IF NOT EXISTS custom1 text;
+> ALTER TABLE bridge_candidates ADD COLUMN IF NOT EXISTS custom2 text;
+> ```
+
+### El `company` que espera el CRM vs. el `company_name` de la tabla
+
+El CRM (`BridgeCandidate.company`) siempre leyó el campo `company`, pero `bridge_candidates` guarda el nombre de la empresa en `company_name` (así es como lo espera `dedup_bridge_candidates`). El resultado: todo candidato llegaba al CRM sin nombre de empresa, aunque el dato estuviera bien persistido — se veía como "Unknown company" en la UI de revisión (QA-F26). `_candidate_public()` en `api/main.py` agrega el alias `company = company_name` a toda fila de `bridge_candidates` antes de devolverla (list, update y confirm-batch) — sin tocar la columna real ni su uso en el dedup. La misma función también evita que `confirm-batch` le pase un `company` vacío al prompt de Claude.
+
 ## Endpoints
 
 ### Leads
@@ -165,6 +182,7 @@ No está confirmado que el actor acepte ese campo, y el actor rechaza el **input
 | GET | `/bridge/runs/{run_id}/logs?organization_id=` | Logs del run |
 | GET | `/bridge/candidates?run_id=&organization_id=` | Candidatos de un run |
 | PATCH | `/bridge/candidates/{candidate_id}` | Confirma / rechaza / restaura un candidato |
+| POST | `/bridge/candidates/confirm-batch` | Confirma varios candidatos a la vez y genera `custom1`/`custom2` para cada uno |
 
 Tanto `POST /runs` como `POST /bridge/runs` son **fire-and-forget**: validan y lanzan la tarea con `asyncio.create_task`, devolviendo de inmediato. El CRM debe hacer polling del estado.
 
@@ -284,7 +302,7 @@ Railway marca como `error` todo lo que sale por **stderr**. Como el logging defa
 | `bridge_seed_lists` | `id`, `organization_id`, `name`, `channel_family`, `company_names[]`, `industry_codes[]`, `company_headcounts[]`, `geo_codes[]` |
 | `bridge_runs` | `id`, `organization_id`, `seed_list_id`, `status`, `total_candidates`, `error_message`, `started_at`, `completed_at` |
 | `bridge_run_logs` | `run_id`, `level`, `message`, `created_at` |
-| `bridge_candidates` | `run_id`, `organization_id`, `seed_list_id`, `channel_family`, `company_name` (NOT NULL), **`company_id`**, **`company_linkedin_url`**, `full_name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `about`, `verification_status`, `created_at`, `updated_at` |
+| `bridge_candidates` | `run_id`, `organization_id`, `seed_list_id`, `channel_family`, `company_name` (NOT NULL, expuesta a la API como `company`, ver Bridge), `company_id`, `company_linkedin_url`, `full_name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `about`, `verification_status`, **`assigned_to`**, **`custom1`**, **`custom2`**, `created_at`, `updated_at` |
 
 > ⚠️ Antes de escribir cualquier query nueva, verificá el nombre exacto de la columna contra esta tabla. **Casi todos los bugs de producción de este proyecto fueron nombres de columna que no coincidían con el esquema real** (ver changelog).
 
@@ -337,6 +355,8 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-26 | Todos los leads de un run multi-país recibían el idioma del primer país de la lista, sin importar su país real | `_detect_market_from_location`: heurística por `location` del lead, con fallback documentado |
 | 2026-07-26 | Mensajes para Taiwan salían en chino simplificado (debían ser tradicional) — `"zh"` a secas es ambiguo para Claude | `_language_instruction()` explicita "Traditional Chinese"/"Simplified Chinese" en el prompt; `default_language` de Taiwan/HK/China debe ser `zh-TW`/`zh-CN` en la tabla `markets` |
 | 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
+| 2026-07-27 | `POST /bridge/candidates/confirm-batch` nunca se implementó → 405 en "Confirm & Send Messages" (QA-F27) | Endpoint agregado; reutiliza `generate_messages_for_batch`; requiere `assigned_to`/`custom1`/`custom2` en `bridge_candidates` (ver Bridge) |
+| 2026-07-27 | Todos los candidatos de Bridge mostraban "Unknown company" pese a tener el company match correcto (QA-F26) | La tabla guarda el nombre en `company_name`, no `company` (el campo que el CRM siempre leyó) → dato bien persistido, nunca expuesto con ese nombre. `_candidate_public()` agrega el alias `company` en toda respuesta de candidatos |
 
 ## Verificación
 
