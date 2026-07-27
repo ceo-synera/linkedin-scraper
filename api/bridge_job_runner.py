@@ -130,6 +130,20 @@ def dedup_bridge_candidates(
     return new_candidates, duplicates_count
 
 
+def _company_linkedin_url(company_id: Optional[str]) -> Optional[str]:
+    """Best-effort company page URL from the actor's `company_id`.
+
+    Pattern per LinkedIn's own numeric-id addressing scheme
+    (linkedin.com/company/<id>/). NOT verified against a live actor response —
+    this needs a real Bridge run (a "specific companies" seed list) checked
+    manually before it's trusted in production. If the pattern turns out
+    wrong for this actor's company_id values, this is the one place to fix.
+    """
+    if not company_id:
+        return None
+    return f"https://www.linkedin.com/company/{company_id}/"
+
+
 def import_bridge_candidates(
     candidates: List[Dict[str, Any]],
     run_id: str,
@@ -152,6 +166,8 @@ def import_bridge_candidates(
         if not company_name:
             continue
 
+        company_id = candidate.get("company_id")
+
         rows.append(
             {
                 "run_id": run_id,
@@ -160,6 +176,8 @@ def import_bridge_candidates(
                 "seed_list_id": seed_list_id,
                 "channel_family": channel_family,
                 "company_name": company_name,
+                "company_id": company_id,
+                "company_linkedin_url": _company_linkedin_url(company_id),
                 "full_name": candidate.get("full_name"),
                 "first_name": candidate.get("first_name"),
                 "last_name": candidate.get("last_name"),

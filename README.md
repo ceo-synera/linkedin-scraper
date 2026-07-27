@@ -122,6 +122,12 @@ Combinables: se manda lo que la seed list tenga configurado.
 
 Los filtros vacíos **se omiten** del input en vez de mandarse como arrays vacíos.
 
+### Agrupación por empresa
+
+`bridge_candidates` guarda `company_id` (el id interno de LinkedIn para la empresa, ya lo extraía `_map_lead` pero se descartaba) y `company_linkedin_url`, construida en `_company_linkedin_url()` con el patrón `https://www.linkedin.com/company/{company_id}/`.
+
+> ⚠️ **Patrón sin verificar contra un run real.** Es el esquema estándar de direccionamiento de LinkedIn por id numérico, pero no se confirmó manualmente que resuelva a la página correcta de empresa para los `company_id` que este actor entrega. Antes de confiar en esta URL en producción, correr un run de Bridge con una seed list de "specific companies" y verificar a mano que el link abra la empresa esperada.
+
 ### Keywords fijas
 
 `BRIDGE_TITLE_KEYWORDS` (17 títulos de partnerships en inglés, español y chino) es fijo y **no configurable por el admin**, a diferencia de los combos de Leads. El admin solo elige en qué empresas/industrias buscar.
@@ -278,7 +284,7 @@ Railway marca como `error` todo lo que sale por **stderr**. Como el logging defa
 | `bridge_seed_lists` | `id`, `organization_id`, `name`, `channel_family`, `company_names[]`, `industry_codes[]`, `company_headcounts[]`, `geo_codes[]` |
 | `bridge_runs` | `id`, `organization_id`, `seed_list_id`, `status`, `total_candidates`, `error_message`, `started_at`, `completed_at` |
 | `bridge_run_logs` | `run_id`, `level`, `message`, `created_at` |
-| `bridge_candidates` | `run_id`, `organization_id`, `seed_list_id`, `channel_family`, `company_name` (NOT NULL), `full_name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `about`, `verification_status`, `created_at`, `updated_at` |
+| `bridge_candidates` | `run_id`, `organization_id`, `seed_list_id`, `channel_family`, `company_name` (NOT NULL), **`company_id`**, **`company_linkedin_url`**, `full_name`, `first_name`, `last_name`, `title`, `linkedin_url`, `location`, `about`, `verification_status`, `created_at`, `updated_at` |
 
 > ⚠️ Antes de escribir cualquier query nueva, verificá el nombre exacto de la columna contra esta tabla. **Casi todos los bugs de producción de este proyecto fueron nombres de columna que no coincidían con el esquema real** (ver changelog).
 
