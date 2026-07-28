@@ -234,6 +234,17 @@ Reglas que se siguen en todo el código:
 - `anthropic_base_url` — default `https://api.anthropic.com`; se puede apuntar a un proxy custom (p. ej. AITokenKing). **Si termina en `/v1` se le recorta**, porque el SDK de Anthropic agrega `/v1` por su cuenta y quedaría `/v1/v1`.
 - `anthropic_model` — se pasa **exactamente como viene**, sin normalizar. Ojo: los proxies tienen su propia nomenclatura; AITokenKing, por ejemplo, no acepta los IDs oficiales de Anthropic. Consultá su `/models` para ver la lista real.
 
+### Precedencia de idioma
+
+`_resolve_language()` decide el idioma final de cada mensaje: `sender_profile.language` (si no es `None`) gana sobre el idioma del mercado, que gana sobre `DEFAULT_LANGUAGE` (`"en"`). Hasta el 2026-07-28 esto se comparaba contra `DEFAULT_LANGUAGE` en vez de contra `None` (`language != "en"` en vez de `language is not None`), y `SenderProfile.language` tenía default `"en"` — dos cosas que hacían indistinguible "el SDR eligió inglés a propósito" de "el SDR nunca tocó el selector". Consecuencias reales:
+
+- Un SDR que configuraba `language="en"` explícitamente para un mercado no-inglés **no tenía ningún efecto**: `"en" == DEFAULT_LANGUAGE` hacía caer el código al idioma del mercado igual, ignorando la elección.
+- Un `sender_profile.language` legado en un valor no-`"en"` (ej. un `"zh"` genérico de antes de la distinción tradicional/simplificado, o un `"es"` de un SDR que normalmente atiende LATAM) le ganaba **a cualquier mercado**, incluso a uno completamente distinto (Canadá/EEUU saliendo en español).
+
+Fix: `SenderProfile.language: Optional[str] = None` (ver `api/models.py`) y `_resolve_language` compara contra `None`, no contra `DEFAULT_LANGUAGE`. Un `language="en"` explícito ahora sí gana; un `language=None` (nunca configurado) cae al mercado como antes.
+
+> ⚠️ Esto requiere que `sender_profiles.language` en Supabase acepte `NULL` — hoy la columna es `NOT NULL DEFAULT 'en'` en el CRM (`AITokenSales`), lo que además significaba que **todo perfil nuevo se guardaba con `'en'` explícito aunque el admin nunca tocara el selector**, reproduciendo el bug para siempre. Requiere migración + cambios en el CRM (`sender-profiles` API routes, `api/runs/route.ts` que embebe el `sender_profile` en el `RunRequest`, y los formularios de perfil) — coordinado en ese repo.
+
 ### Chino: simplificado vs. tradicional
 
 Un código `"zh"` a secas es ambiguo para Claude entre script simplificado y tradicional — probado en producción, por defecto genera **simplificado**, que se lee como chino continental y es un error notorio para Taiwan/Hong Kong. `_language_instruction()` en `message_generator.py` traduce el código a una instrucción explícita antes de armar el prompt (`"zh-TW"` → *"Traditional Chinese (繁體中文), as used in Taiwan"*, `"zh-CN"` → *"Simplified Chinese (简体中文)..."*; un `"zh"` a secas que aún llegue se resuelve a simplificado, igual que el default observado). El resto de los idiomas (`es`, `vi`, `pt`, `ja`...) pasa sin tocar — no se observó una ambigüedad equivalente.
@@ -264,7 +275,7 @@ Una sola respuesta truncada solía tirar el run entero y perder todos los mensaj
 - **Premium+**: perfil completo del SDR (`years_experience`, `seniority`, `expertise_area`).
 - Límites de caracteres desde `sender_profiles.connection_note_max_chars` / `followup_max_chars`; default 300 / 500.
 - **`company_context`** (texto libre que configura el admin, viaja en el `RunRequest`) se inyecta en el prompt para que el mensaje suene informado sobre el negocio. Si viene vacío, esa sección se omite por completo.
-- **Idioma por mercado**: si no hay sender profile (Basic) o su idioma es el default, se usa el del mercado — `taiwan→zh`, `latam→es`, `vietnam→vi`, `global→en`. Se resuelve **por lead**, no por batch.
+- **Idioma por mercado**: si no hay sender profile (Basic) o su `language` es `None` (nunca configurado), se usa el del mercado — `taiwan→zh-TW`, `latam→es`, `vietnam→vi`, `global→en`. Se resuelve **por lead**, no por batch. Ver "Precedencia de idioma" más abajo — un `sender_profile.language` explícito (incluido `"en"`) siempre gana sobre el mercado.
 
 ## Concurrencia y el event loop
 
@@ -357,6 +368,7 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-23 | Cualquiera con la URL de Railway podía llamar al backend | `X-Internal-Api-Key` obligatorio (401), activable vía `INTERNAL_API_KEY` |
 | 2026-07-27 | `POST /bridge/candidates/confirm-batch` nunca se implementó → 405 en "Confirm & Send Messages" (QA-F27) | Endpoint agregado; reutiliza `generate_messages_for_batch`; requiere `assigned_to`/`custom1`/`custom2` en `bridge_candidates` (ver Bridge) |
 | 2026-07-27 | Todos los candidatos de Bridge mostraban "Unknown company" pese a tener el company match correcto (QA-F26) | La tabla guarda el nombre en `company_name`, no `company` (el campo que el CRM siempre leyó) → dato bien persistido, nunca expuesto con ese nombre. `_candidate_public()` agrega el alias `company` en toda respuesta de candidatos |
+| 2026-07-28 | Idioma de mensajes roto en todos los mercados: un `language="en"` explícito de un SDR se ignoraba; un `language` legado no-`"en"` de un SDR le ganaba a cualquier mercado (Canadá/EEUU saliendo en español; Taiwan/HK inconsistente entre SDRs) | `_resolve_language` comparaba contra `DEFAULT_LANGUAGE` en vez de `None`, y `SenderProfile.language` defaulteaba a `"en"` — indistinguible de "nunca configurado". `language: Optional[str] = None` + comparación contra `None`. Requiere que `sender_profiles.language` acepte `NULL` (hoy `NOT NULL DEFAULT 'en'` en el CRM) y limpieza de los perfiles ya corrompidos por el bug |
 
 ## Verificación
 

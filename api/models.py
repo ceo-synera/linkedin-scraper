@@ -18,7 +18,11 @@ class SenderProfile(BaseModel):
     company: str
     style_hint: Optional[str] = None
     icp_focus: List[str] = Field(default_factory=list)
-    language: str = "en"
+    # None means "the SDR never touched the language selector" — distinct from
+    # an explicit "en", which must win over the market's own language (see
+    # message_generator._resolve_language). Defaulting this to "en" made an
+    # explicit English choice indistinguishable from no choice at all.
+    language: Optional[str] = None
     years_experience: Optional[int] = None
     seniority: Optional[str] = None
     expertise_area: Optional[str] = None

@@ -56,22 +56,27 @@ _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _resolve_language(
-    language: str,
+    language: Optional[str],
     market: Optional[str],
     sender_profile: Optional[SenderProfile],
     market_languages: Optional[Dict[str, str]] = None,
 ) -> str:
     """Language for one lead's message.
 
-    A profile with an explicitly non-default language wins. Otherwise (Basic,
-    or a profile still on the default language) fall back to the market's
-    language instead of always defaulting to English.
+    A profile with an explicit language (not None) wins, including an
+    explicit "en" — that's a real SDR choice and must not be second-guessed.
+    A profile that never set one (None: Basic, or an SDR who never touched
+    the selector) falls back to the market's language instead of always
+    defaulting to English. Comparing against None rather than DEFAULT_LANGUAGE
+    is what makes "en" and "unset" distinguishable at all; the old
+    `language != DEFAULT_LANGUAGE` check silently overrode an explicit English
+    choice whenever the market's own language differed.
 
     market_languages comes from the `markets` table, resolved once per run by
     the caller — looking it up per lead would mean a DB round trip for every
     single message.
     """
-    if sender_profile is not None and language and language != DEFAULT_LANGUAGE:
+    if sender_profile is not None and language is not None:
         return language
 
     if not market_languages:
