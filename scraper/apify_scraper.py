@@ -407,9 +407,7 @@ def _harvest_input(
 _HARVEST_FIELD_CANDIDATES = (
     ("first_name", ("firstName", "first_name")),
     ("last_name", ("lastName", "last_name")),
-    ("job_title", ("headline", "currentPosition", "jobTitle", "job_title", "title")),
-    ("company", ("companyName", "company", "currentCompany")),
-    ("company_id", ("companyId", "company_id")),
+    ("job_title", ("headline", "jobTitle", "job_title", "title")),
     ("linkedin_url", ("linkedinUrl", "profileUrl", "url", "linkedin_url")),
     ("location", ("location", "locationName", "geoLocation")),
     ("about", ("about", "summary")),
@@ -420,12 +418,32 @@ _HARVEST_FIELD_CANDIDATES = (
 def _pick(item: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
     for key in keys:
         value = item.get(key)
-        if isinstance(value, dict):
-            # e.g. currentPosition: {"companyName": ..., "title": ...}
-            value = value.get("title") or value.get("name") or value.get("companyName")
         if value not in (None, "", [], {}):
             return value
     return None
+
+
+def _first_position(item: Dict[str, Any]) -> Dict[str, Any]:
+    """The current role, as a dict, from whichever shape the actor used.
+
+    Company name and id are NOT top-level fields — confirmed against a real
+    run, whose top-level keys were firstName/lastName/headline/linkedinUrl/
+    location/about/publicIdentifier/currentPosition/experience/... with no
+    `companyName` anywhere. Reading `companyName` off the item (as the first
+    version of this mapper did) therefore yielded None for every single lead,
+    silently: the run reports success, leads store fine, and the damage only
+    surfaces as outreach addressed to "<name> at None".
+
+    `currentPosition` may be a list or a single dict depending on build, so
+    both are handled; `experience[0]` is the fallback.
+    """
+    for key in ("currentPosition", "experience"):
+        value = item.get(key)
+        if isinstance(value, list) and value:
+            value = value[0]
+        if isinstance(value, dict) and value:
+            return value
+    return {}
 
 
 def _map_harvest_lead(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -442,6 +460,23 @@ def _map_harvest_lead(item: Dict[str, Any]) -> Dict[str, Any]:
         parts = [lead.get("first_name"), lead.get("last_name")]
         full_name = " ".join(p for p in parts if p).strip() or None
     lead["full_name"] = full_name
+
+    # Company lives inside the current role, never at the top level. Getting
+    # this wrong is expensive rather than merely wrong: `company` is what the
+    # outreach message is built around, so a None here ships personalised
+    # messages that address the prospect at no company at all.
+    position = _first_position(item)
+    lead["company"] = _pick(position, ("companyName", "company", "name"))
+    lead["company_id"] = _pick(position, ("companyId", "company_id", "id"))
+
+    # `headline` is a free-text tagline ("CIO | Digital Transformation | ...")
+    # rather than a job title. Prefer the structured role title when the
+    # position carries one, and keep the headline only as the fallback — the
+    # ICP scorer matches this against the combo's title keywords, so a
+    # marketing tagline scores worse than the actual role.
+    position_title = _pick(position, ("title", "position", "jobTitle"))
+    if position_title:
+        lead["job_title"] = position_title
 
     # `title` and `job_title` are the same value under two names: the ICP
     # scorer reads job_title, job_runner and the message generator read title.
