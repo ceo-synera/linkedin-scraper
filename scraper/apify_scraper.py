@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -42,6 +43,73 @@ def _dump(value: Any) -> str:
         return repr(value)
 
 ACTOR_ID = "bestscrapers/sales-navigator-scraper-by-filters"
+
+# ---------------------------------------------------------------------------
+# HarvestAPI — alternative search actor (opt-in, off by default)
+# ---------------------------------------------------------------------------
+#
+# WHY: the incumbent actor bills $0.50 per init_search plus $0.01 per
+# country×combo cell — i.e. per cell REQUESTED, whether or not it returns a
+# single lead. A measured run (16 countries × 3 combos, 25 leads) was billed
+# for 48 cells; another (5 countries × 3 combos) returned 85 leads for 15
+# cells — a 10x spread in cost per lead driven purely by how many countries
+# were ticked, not by output. HarvestAPI bills per profile actually returned
+# ($0.10 per search page of ~25 + $0.004 per full profile), so cost tracks
+# results instead of request breadth, and it accepts every country in ONE
+# call rather than one search per country.
+#
+# It is also a materially better-maintained actor: 4.8/5 over 82 reviews and
+# 33K users, against 0.0/0 reviews and 584 users for the incumbent.
+#
+# HOW: set SCRAPER_ACTOR=harvest to switch. Anything else (including unset)
+# keeps the incumbent path untouched. This is deliberately a runtime switch
+# and not a replacement: the output field mapping below is inferred from the
+# actor's published sample and has NOT yet been confirmed against a real run,
+# so the safe rollback has to be one env var, not a revert.
+HARVEST_ACTOR_ID = "harvestapi/linkedin-profile-search"
+
+
+def _use_harvest() -> bool:
+    return os.getenv("SCRAPER_ACTOR", "").strip().lower() == "harvest"
+
+
+# Sales Navigator headcount label -> HarvestAPI code.
+#
+# ⚠ These letters are NOT the same letters the incumbent actor uses, and the
+# collision is silent. COMPANY_HEADCOUNT_CODE_MAP below maps A->"1-10";
+# HarvestAPI's A is "Self-employed" and its B is "1-10" — every bracket is
+# shifted by one. Passing a letter straight through from one actor to the
+# other therefore yields a plausible-looking filter for the WRONG company
+# size, with no error anywhere. Always map via the human-readable label.
+# Confirmed against the actor's own input reference; "10001+"->"I" is the one
+# row extrapolated past the end of that table and still needs verifying.
+HARVEST_HEADCOUNT = {
+    "1-10": "B",
+    "11-50": "C",
+    "51-200": "D",
+    "201-500": "E",
+    "501-1000": "F",
+    "1001-5000": "G",
+    "5001-10000": "H",
+    "10001+": "I",  # UNVERIFIED — table in the actor docs stops at H
+}
+
+# Sales Navigator seniority label -> HarvestAPI numeric id (sent as a STRING;
+# the actor's own console emits e.g. ["220","310","300"], not integers).
+# All ten of ALLOWED_SENIORITY_LEVELS map 1:1 — both actors use the same
+# Sales Navigator vocabulary, so nothing is lost in translation here.
+HARVEST_SENIORITY = {
+    "In Training": "100",
+    "Entry Level": "110",
+    "Senior": "120",
+    "Strategic": "130",
+    "Entry Level Manager": "200",
+    "Experienced Manager": "210",
+    "Director": "220",
+    "Vice President": "300",
+    "CXO": "310",
+    "Owner/Partner": "320",
+}
 
 # Markets are no longer a hardcoded dict — they live in the `markets` table so
 # an org can pick from real countries and adding one takes no code change. One
@@ -266,6 +334,251 @@ STALL_LIMIT = 8
 # (e.g. one sitting at "Done 100/100" about to flip). If it's genuinely stuck
 # this costs one extra wait, not the full MAX_PROCESSING_RETRIES.
 STALL_GRACE_SECONDS = 45
+
+
+def _harvest_input(
+    combo: Dict[str, Any],
+    market_names: List[str],
+    limit: int,
+    start_page: int,
+    emit: LogFn,
+) -> Dict[str, Any]:
+    """Build HarvestAPI's input from the same combo shape the incumbent uses.
+
+    Key names confirmed against the actor console's own JSON output, so they
+    are exact rather than guessed. Two structural differences from the
+    incumbent are worth knowing:
+
+      * `locations` takes country NAMES, not LinkedIn geo codes — which is
+        what `run_scraping` already receives in `markets`, so the geo_code
+        lookup is not needed on this path at all.
+      * `locations` accepts the whole list in ONE call. The incumbent needed
+        one search per country×combo cell; here 16 countries and 1 combo is a
+        single request. This is the change that removes the cost blow-up.
+    """
+    headcounts: List[str] = []
+    for label in _normalize_company_headcounts(combo.get("company_headcounts", [])):
+        code = HARVEST_HEADCOUNT.get(label)
+        if code:
+            headcounts.append(code)
+        else:
+            emit(f"[harvest] dropped unmapped headcount label: {label!r}")
+
+    seniorities: List[str] = []
+    for label in _normalize_seniority_levels(combo.get("seniority_levels", []), emit):
+        sid = HARVEST_SENIORITY.get(label)
+        if sid:
+            seniorities.append(sid)
+        else:
+            emit(f"[harvest] dropped unmapped seniority label: {label!r}")
+
+    payload: Dict[str, Any] = {
+        # "Full" = $0.10 per search page + $0.004 per profile. "Full + email
+        # search" costs $0.01 per profile instead and adds an email column we
+        # have nowhere to store yet — revisit once prospects has a field for
+        # it, since it is the cheapest email source we have found.
+        "profileScraperMode": "Full",
+        "currentJobTitles": _truncate_title_keywords(
+            combo.get("title_keywords", []), emit
+        ),
+        "locations": list(market_names),
+        "maxItems": limit,
+        "startPage": start_page,
+        # Left off deliberately: autoQuerySegmentation splits one query into
+        # many to break past LinkedIn's ~1000-result-per-query ceiling. It
+        # multiplies search pages (and therefore cost), and our per-combo
+        # targets are far below that ceiling, so it would be spend with no
+        # return. Turn it on only for a combo that provably saturates.
+        "autoQuerySegmentation": False,
+    }
+    if headcounts:
+        payload["companyHeadcount"] = headcounts
+    if seniorities:
+        payload["seniorityLevelIds"] = seniorities
+    if combo.get("posted_on_linkedin"):
+        payload["recentlyPostedOnLinkedIn"] = True
+    return payload
+
+
+# HarvestAPI returns camelCase and splits the name into parts; the incumbent
+# returned snake_case with a pre-joined `full_name`. Each tuple is (our field,
+# candidate source keys in priority order) so one mapper tolerates both the
+# documented shape and minor drift between actor builds.
+_HARVEST_FIELD_CANDIDATES = (
+    ("first_name", ("firstName", "first_name")),
+    ("last_name", ("lastName", "last_name")),
+    ("job_title", ("headline", "currentPosition", "jobTitle", "job_title", "title")),
+    ("company", ("companyName", "company", "currentCompany")),
+    ("company_id", ("companyId", "company_id")),
+    ("linkedin_url", ("linkedinUrl", "profileUrl", "url", "linkedin_url")),
+    ("location", ("location", "locationName", "geoLocation")),
+    ("about", ("about", "summary")),
+    ("profile_id", ("publicIdentifier", "id", "profile_id")),
+)
+
+
+def _pick(item: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, dict):
+            # e.g. currentPosition: {"companyName": ..., "title": ...}
+            value = value.get("title") or value.get("name") or value.get("companyName")
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _map_harvest_lead(item: Dict[str, Any]) -> Dict[str, Any]:
+    lead: Dict[str, Any] = {}
+    for field, candidates in _HARVEST_FIELD_CANDIDATES:
+        lead[field] = _pick(item, candidates)
+
+    # `full_name` has no direct counterpart — HarvestAPI splits the name — so
+    # rebuild it. Downstream (`cleanScrapedName`, message generation, the CRM's
+    # prospects.name) all read full_name, so leaving it None would produce
+    # nameless leads that look like a scraper failure rather than a mapping bug.
+    full_name = _pick(item, ("fullName", "full_name", "name"))
+    if not full_name:
+        parts = [lead.get("first_name"), lead.get("last_name")]
+        full_name = " ".join(p for p in parts if p).strip() or None
+    lead["full_name"] = full_name
+
+    # `title` and `job_title` are the same value under two names: the ICP
+    # scorer reads job_title, job_runner and the message generator read title.
+    lead["title"] = lead.get("job_title")
+    return lead
+
+
+def _scrape_combo_harvest(
+    client: ApifyClient,
+    combo: Dict[str, Any],
+    market_names: List[str],
+    cell_target: int,
+    organization_id: str,
+    market: str,
+    combo_code: Optional[str],
+    emit: LogFn,
+) -> Dict[str, Any]:
+    """HarvestAPI equivalent of `_scrape_combo`, returning the same session
+    dict so everything above it — the absorb/dedup loop, the 80% shortfall
+    retry, market detection — works unchanged.
+
+    The two-flow machinery has no equivalent here and is not reimplemented:
+    HarvestAPI is a single synchronous call, so there is no request_id to
+    carry, no 5-10 minute init wait to amortise, and no "processing" state to
+    poll. `request_id` stays None in the session for exactly that reason.
+    """
+    leads_to_fetch = int(cell_target * OVERFETCH_MULTIPLIER)
+    session: Dict[str, Any] = {
+        "combo_code": combo_code,
+        "market": market,
+        "cell_target": cell_target,
+        "request_id": None,
+        "raw_leads": [],
+        "leads": [],
+        "last_page": 0,
+        "exhausted": True,
+    }
+
+    run_input = _harvest_input(combo, market_names, leads_to_fetch, 1, emit)
+    emit(f"[harvest] code={combo_code!r} input: {_dump(run_input)}")
+
+    try:
+        items = _call_actor_harvest(client, run_input)
+    except Exception as exc:  # noqa: BLE001 - one combo must not kill the run
+        emit(f"[harvest] code={combo_code!r} actor call failed: {exc!r}")
+        return session
+
+    if not items:
+        emit(f"[harvest] code={combo_code!r} returned no items")
+        return session
+
+    # Log the first item's keys verbatim once per combo. The field mapping
+    # above is inferred from published samples, and this line is what turns a
+    # silent mis-map (leads arriving with every field None) into something
+    # diagnosable from the Railway logs alone.
+    emit(f"[harvest] first item keys: {sorted(_first_dict(items).keys())}")
+
+    raw = [item for item in items if isinstance(item, dict)]
+    mapped = [_map_harvest_lead(item) for item in raw]
+    mapped = [lead for lead in mapped if lead.get("linkedin_url")]
+
+    new_leads, _ = dedup_leads(mapped, organization_id) if mapped else ([], 0)
+    session["raw_leads"] = raw
+    session["leads"] = new_leads
+    session["last_page"] = 1
+    # A short result set means the query is spent; a full one means more pages
+    # exist. Mirrors the incumbent's meaning so the shortfall retry above can
+    # reason about both paths identically.
+    session["exhausted"] = len(raw) < leads_to_fetch
+    # The incumbent's retry resumes by request_id alone; HarvestAPI has no such
+    # handle, so the retry has to rebuild the query. Carry what it needs.
+    session["combo"] = combo
+    session["market_names"] = list(market_names)
+    emit(
+        f"[harvest] code={combo_code!r} raw={len(raw)} mapped={len(mapped)} "
+        f"new_after_dedup={len(new_leads)} exhausted={session['exhausted']}"
+    )
+    return session
+
+
+def _retry_harvest_page(
+    client: ApifyClient,
+    session: Dict[str, Any],
+    organization_id: str,
+    emit: LogFn,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, bool]:
+    """Fetch one more page for a HarvestAPI combo that fell short.
+
+    Returns the same 4-tuple as `_paginate_with_dedup` so the retry loop
+    treats both actors identically. Dedup runs over the combo's ACCUMULATED
+    raw items, not just this page's, so a lead already collected in the main
+    pass is not counted twice toward the target.
+    """
+    next_page = session["last_page"] + 1
+    shortfall = session["cell_target"] - len(session["leads"])
+    run_input = _harvest_input(
+        session["combo"],
+        session["market_names"],
+        max(shortfall, 1),
+        next_page,
+        emit,
+    )
+    emit(
+        f"[harvest retry] code={session['combo_code']!r} page={next_page} "
+        f"short by {shortfall}: {_dump(run_input)}"
+    )
+
+    try:
+        items = _call_actor_harvest(client, run_input)
+    except Exception as exc:  # noqa: BLE001 - a failed retry is not a failed run
+        emit(f"[harvest retry] code={session['combo_code']!r} failed: {exc!r}")
+        return session["leads"], session["raw_leads"], session["last_page"], True
+
+    page_raw = [item for item in items if isinstance(item, dict)]
+    if not page_raw:
+        emit(f"[harvest retry] code={session['combo_code']!r} page {next_page} empty")
+        return session["leads"], session["raw_leads"], next_page, True
+
+    raw = list(session["raw_leads"]) + page_raw
+    mapped = [_map_harvest_lead(item) for item in raw]
+    mapped = [lead for lead in mapped if lead.get("linkedin_url")]
+    new_leads, _ = dedup_leads(mapped, organization_id) if mapped else ([], 0)
+
+    exhausted = len(page_raw) < max(shortfall, 1)
+    emit(
+        f"[harvest retry] code={session['combo_code']!r} page={next_page} "
+        f"got={len(page_raw)} total_new={len(new_leads)} exhausted={exhausted}"
+    )
+    return new_leads, raw, next_page, exhausted
+
+
+def _call_actor_harvest(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
+    run = client.actor(HARVEST_ACTOR_ID).call(run_input=run_input, logger=None)
+    dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
+    if not dataset_id:
+        return []
+    return client.dataset(dataset_id).list_items().items
 
 
 def _try_fetch_once(
@@ -896,16 +1209,31 @@ def run_scraping(
             f"[combo] market={market_label!r} code={combo_code!r} "
             f"target={cell_target} remaining={remaining}"
         )
-        session = _scrape_combo(
-            client,
-            combo,
-            combined_geo_codes,
-            cell_target,
-            organization_id,
-            market_label,
-            combo_code,
-            emit,
-        )
+        # Same session contract either way — see _scrape_combo_harvest. The
+        # incumbent needs geo CODES, HarvestAPI needs country NAMES, and
+        # `markets` already holds the names, so neither path converts.
+        if _use_harvest():
+            session = _scrape_combo_harvest(
+                client,
+                combo,
+                markets,
+                cell_target,
+                organization_id,
+                market_label,
+                combo_code,
+                emit,
+            )
+        else:
+            session = _scrape_combo(
+                client,
+                combo,
+                combined_geo_codes,
+                cell_target,
+                organization_id,
+                market_label,
+                combo_code,
+                emit,
+            )
         cell_sessions.append(session)
 
         added = _absorb(session["leads"], market_label, combo_code)
@@ -931,10 +1259,17 @@ def run_scraping(
         # Skip combos the actor already confirmed have nothing more (a
         # short/empty page) — only ones that stopped because they hit their
         # page budget (there might be more) are worth another request.
+        # A HarvestAPI session has no request_id — it is one synchronous call,
+        # so there is nothing to resume — but it is still retryable by asking
+        # for the next page. Gating on request_id alone (as this did) would
+        # have silently excluded every harvest combo from the shortfall retry,
+        # quietly capping those runs at whatever the first page returned.
         retryable = [
             s
             for s in cell_sessions
-            if s["request_id"] and not s["exhausted"] and len(s["leads"]) < s["cell_target"]
+            if not s["exhausted"]
+            and len(s["leads"]) < s["cell_target"]
+            and (s["request_id"] or s.get("combo"))
         ]
         retryable.sort(key=lambda s: s["cell_target"] - len(s["leads"]), reverse=True)
 
@@ -947,18 +1282,26 @@ def run_scraping(
             # — not a cumulative total, since a combo that already used its
             # first budget in the main pass is precisely the case worth
             # retrying here.
-            new_leads, raw, last_page, exhausted = _paginate_with_dedup(
-                client,
-                session["request_id"],
-                session["cell_target"],
-                organization_id,
-                session["raw_leads"],
-                session["last_page"] + 1,
-                session["last_page"] + MAX_COMBO_PAGES,
-                session["market"],
-                session["combo_code"],
-                emit,
-            )
+            if session["request_id"]:
+                new_leads, raw, last_page, exhausted = _paginate_with_dedup(
+                    client,
+                    session["request_id"],
+                    session["cell_target"],
+                    organization_id,
+                    session["raw_leads"],
+                    session["last_page"] + 1,
+                    session["last_page"] + MAX_COMBO_PAGES,
+                    session["market"],
+                    session["combo_code"],
+                    emit,
+                )
+            else:
+                new_leads, raw, last_page, exhausted = _retry_harvest_page(
+                    client,
+                    session,
+                    organization_id,
+                    emit,
+                )
             session["raw_leads"] = raw
             session["last_page"] = last_page
             session["exhausted"] = exhausted
