@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 import math
@@ -640,15 +641,48 @@ def _harvest_charge_cap(max_items: int) -> float:
     return round(max(expected * 4, 1.0), 2)
 
 
+def _supported_call_kwargs(actor_client: Any, desired: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only the kwargs this installed apify-client's .call() accepts.
+
+    requirements.txt pins `apify-client>=1.7.0`, an open range, so the version
+    actually deployed is whatever the last image build resolved — not whatever
+    is current. `timeout_secs`, `wait_secs` and `max_total_charge_usd` are all
+    recent additions; passing them blind raised
+    `TypeError: unexpected keyword argument 'timeout_secs'` on Railway and
+    failed every combo, while the same call worked against a freshly installed
+    2.5.1 locally.
+
+    Introspecting the signature means the guards apply where the client
+    supports them and are skipped where it does not, instead of the whole
+    scraper depending on a version nobody pinned.
+    """
+    try:
+        accepted = inspect.signature(actor_client.call).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {k: v for k, v in desired.items() if k in accepted}
+
+
 def _call_actor_harvest(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
-    cap = _harvest_charge_cap(int(run_input.get("maxItems") or 25))
-    run = client.actor(HARVEST_ACTOR_ID).call(
-        run_input=run_input,
-        logger=None,
-        timeout_secs=HARVEST_CALL_TIMEOUT_SECONDS,
-        wait_secs=HARVEST_CALL_TIMEOUT_SECONDS,
-        max_total_charge_usd=cap,
+    actor_client = client.actor(HARVEST_ACTOR_ID)
+    guards = _supported_call_kwargs(
+        actor_client,
+        {
+            "timeout_secs": HARVEST_CALL_TIMEOUT_SECONDS,
+            "wait_secs": HARVEST_CALL_TIMEOUT_SECONDS,
+            "max_total_charge_usd": _harvest_charge_cap(
+                int(run_input.get("maxItems") or 25)
+            ),
+        },
     )
+    missing = {"timeout_secs", "wait_secs", "max_total_charge_usd"} - set(guards)
+    if missing:
+        log.warning(
+            "[harvest] apify-client too old for %s — call runs unguarded; "
+            "pin a newer apify-client to restore the timeout and spend cap",
+            sorted(missing),
+        )
+    run = actor_client.call(run_input=run_input, logger=None, **guards)
     # On timeout the client returns whatever state the run is in rather than
     # raising, so an unfinished run must be treated as empty instead of having
     # its (absent or partial) dataset read as if it were complete.
