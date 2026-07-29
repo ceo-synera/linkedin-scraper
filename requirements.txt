@@ -2,6 +2,12 @@ fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 supabase>=2.4.0
 python-dotenv>=1.0.0
-apify-client>=1.7.0
+# >=2.5 for ActorClient.call(timeout_secs=, wait_secs=): without them a queued
+# or hung actor run blocks the worker for the ACTOR's own timeout, which is
+# 30,000s (8+ hours) on harvestapi/linkedin-profile-search. Observed in
+# production before this pin — a run sat with no log line after "Searching
+# LinkedIn via Apify..." until it was killed. `>=1.7.0` was an open range that
+# happened to resolve to a build without those parameters.
+apify-client>=2.5.1
 anthropic>=0.40.0
 requests>=2.31.0

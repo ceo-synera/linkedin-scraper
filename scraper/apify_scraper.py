@@ -69,6 +69,19 @@ ACTOR_ID = "bestscrapers/sales-navigator-scraper-by-filters"
 # so the safe rollback has to be one env var, not a revert.
 HARVEST_ACTOR_ID = "harvestapi/linkedin-profile-search"
 
+# MAX_TITLE_KEYWORDS (20) is the INCUMBENT's ceiling — it rejects a larger
+# input outright. HarvestAPI's own input schema declares maxItems: 50 for
+# `currentJobTitles` (and 70 for `locations`, which comfortably fits every
+# country in the markets table in a single call).
+#
+# The 30 extra slots matter because combos are global while job titles are
+# per-language: combo_B already spends 20/20 on 10 English, 4 Spanish and 6
+# Traditional Chinese variants, so no market gets full coverage and no new
+# variant can be added for any of them. Titles are free under this actor's
+# pricing — it bills per profile RETURNED, not per filter sent — so a wider
+# title list is strictly better matching at no extra cost.
+HARVEST_MAX_TITLES = 50
+
 
 def _use_harvest() -> bool:
     return os.getenv("SCRAPER_ACTOR", "").strip().lower() == "harvest"
@@ -186,15 +199,16 @@ MAX_TITLE_KEYWORDS = 20
 
 
 def _truncate_title_keywords(
-    values: List[str], emit: LogFn, label: str = "combo"
+    values: List[str], emit: LogFn, label: str = "combo", limit: Optional[int] = None
 ) -> List[str]:
+    cap = limit or MAX_TITLE_KEYWORDS
     keywords = list(values or [])
-    if len(keywords) > MAX_TITLE_KEYWORDS:
+    if len(keywords) > cap:
         emit(
             f"[{label}] title_keywords has {len(keywords)} items, truncating to "
-            f"{MAX_TITLE_KEYWORDS} (Apify limit)"
+            f"{cap} (actor limit)"
         )
-        return keywords[:MAX_TITLE_KEYWORDS]
+        return keywords[:cap]
     return keywords
 
 
@@ -380,7 +394,7 @@ def _harvest_input(
         # it, since it is the cheapest email source we have found.
         "profileScraperMode": "Full",
         "currentJobTitles": _truncate_title_keywords(
-            combo.get("title_keywords", []), emit
+            combo.get("title_keywords", []), emit, limit=HARVEST_MAX_TITLES
         ),
         "locations": list(market_names),
         "maxItems": limit,
