@@ -608,8 +608,59 @@ def _retry_harvest_page(
     return new_leads, raw, next_page, exhausted
 
 
+# `.call()` blocks until the actor finishes and, left alone, honours the
+# ACTOR's own timeout — which for linkedin-profile-search is 30,000s, i.e. over
+# eight hours. A queued or hung run would therefore pin a Railway worker for
+# the rest of the day with no log line after "Searching LinkedIn via Apify...".
+# (Observed: a run on a Free-plan token sat at READY, never started, and the
+# call never returned.) The incumbent path was implicitly bounded by
+# MAX_PROCESSING_RETRIES; this replaces that bound explicitly.
+#
+# 6 minutes: a healthy 30-profile call measured ~75s, so this is ~5x headroom
+# for a slow one while still failing the combo — not the run — inside a
+# timeframe a human is willing to wait.
+HARVEST_CALL_TIMEOUT_SECONDS = 360
+
+
+def _harvest_charge_cap(max_items: int) -> float:
+    """Hard ceiling on what one combo call may bill, in USD.
+
+    Apify enforces this server-side and aborts the run rather than exceeding
+    it, so it is a real guard and not just bookkeeping.
+
+    Sized from measured pricing — $0.10 per search page of ~25 profiles plus
+    $0.004 per profile — then multiplied by 4. A healthy 30-profile call bills
+    about $0.32 and is capped at $1.60, so the cap only ever fires on a run
+    that has gone materially wrong (pathological filters paging forever, an
+    actor-side pricing change). Without it, a single misbehaving combo can bill
+    without bound; that failure mode is precisely what this whole migration
+    exists to remove, so leaving it unguarded would be inconsistent.
+    """
+    expected = (max_items / 25.0) * 0.10 + max_items * 0.004
+    return round(max(expected * 4, 1.0), 2)
+
+
 def _call_actor_harvest(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
-    run = client.actor(HARVEST_ACTOR_ID).call(run_input=run_input, logger=None)
+    cap = _harvest_charge_cap(int(run_input.get("maxItems") or 25))
+    run = client.actor(HARVEST_ACTOR_ID).call(
+        run_input=run_input,
+        logger=None,
+        timeout_secs=HARVEST_CALL_TIMEOUT_SECONDS,
+        wait_secs=HARVEST_CALL_TIMEOUT_SECONDS,
+        max_total_charge_usd=cap,
+    )
+    # On timeout the client returns whatever state the run is in rather than
+    # raising, so an unfinished run must be treated as empty instead of having
+    # its (absent or partial) dataset read as if it were complete.
+    status = _run_field(run, "status", "status")
+    if status and str(status).upper() not in ("SUCCEEDED",):
+        log.warning(
+            "[harvest] actor run did not succeed within %ss (status=%s); "
+            "treating this combo as empty",
+            HARVEST_CALL_TIMEOUT_SECONDS,
+            status,
+        )
+        return []
     dataset_id = _run_field(run, "defaultDatasetId", "default_dataset_id")
     if not dataset_id:
         return []
