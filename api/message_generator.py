@@ -47,9 +47,64 @@ _CHINESE_VARIANT_INSTRUCTIONS = {
     "zh": "Simplified Chinese (简体中文)",
 }
 
+# Every other code used to fall through to _build_prompt RAW, so the prompt
+# read literally "Write two LinkedIn outreach messages in en for this
+# prospect" — an ISO code, not a language. Measured on 28/07: a Canada +
+# United States run resolved correctly to "en" (run logs confirm 8 leads by
+# location + 3 by region fallback, and markets.default_language is 'en' for
+# both countries) and the messages still came back in SPANISH.
+#
+# Two data points bound the diagnosis:
+#   - Bridge messages, same proxy and same model (claude-sonnet-5), came back
+#     in correct English. Bridge does NOT go through this function, which is
+#     the main difference between the two paths.
+#   - The Taiwan runs got a full, unambiguous prose instruction
+#     ("Traditional Chinese (繁體中文), as used in Taiwan") and STILL returned
+#     Simplified in one run and Traditional in another, minutes apart.
+#
+# So a bare ISO code cannot be the whole story — the Taiwan case rules that
+# out — but "in en" is a degenerate instruction regardless, and it is the one
+# difference that lines up with the Canada/US case. Naming the language
+# explicitly removes it as a variable so the remaining non-determinism can be
+# attributed cleanly.
+_LANGUAGE_NAMES = {
+    "en": "English",
+    "es": "Spanish",
+    "pt": "Portuguese",
+    "pt-br": "Brazilian Portuguese",
+    "vi": "Vietnamese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "th": "Thai",
+    "id": "Indonesian",
+    "ar": "Arabic",
+    "de": "German",
+    "fr": "French",
+    "it": "Italian",
+    "nl": "Dutch",
+    "pl": "Polish",
+}
+
 
 def _language_instruction(language: str) -> str:
-    return _CHINESE_VARIANT_INSTRUCTIONS.get((language or "").strip().lower(), language)
+    """Human-readable language for the prompt — never a bare ISO code.
+
+    Chinese variants win (they carry script + regional register), then the
+    plain language names, then a last-resort passthrough for a code we don't
+    know yet. The passthrough keeps behaviour defined for an unmapped value
+    instead of raising mid-run, but it is the case worth adding to the map.
+    """
+    key = (language or "").strip().lower()
+    if key in _CHINESE_VARIANT_INSTRUCTIONS:
+        return _CHINESE_VARIANT_INSTRUCTIONS[key]
+    if key in _LANGUAGE_NAMES:
+        return _LANGUAGE_NAMES[key]
+    if key:
+        log.warning(
+            "No language name mapped for %r — sending the raw code to the "
+            "model. Add it to _LANGUAGE_NAMES.", language
+        )
+    return language
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
