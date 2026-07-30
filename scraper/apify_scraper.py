@@ -470,11 +470,15 @@ def _harvest_input(
 _HARVEST_FIELD_CANDIDATES = (
     ("first_name", ("firstName", "first_name")),
     ("last_name", ("lastName", "last_name")),
+    # `headline` exists only in Full mode; Short mode has no equivalent, so the
+    # job title has to come from the current position (handled after this loop).
     ("job_title", ("headline", "jobTitle", "job_title", "title")),
     ("linkedin_url", ("linkedinUrl", "profileUrl", "url", "linkedin_url")),
     ("location", ("location", "locationName", "geoLocation")),
+    # Full mode calls it `about`; Short mode calls it `summary`.
     ("about", ("about", "summary")),
-    ("profile_id", ("publicIdentifier", "id", "profile_id")),
+    # Full mode: `publicIdentifier`. Short mode: `profileIdInSearch`.
+    ("profile_id", ("publicIdentifier", "profileIdInSearch", "id", "profile_id")),
 )
 
 
@@ -538,10 +542,21 @@ def _first_position(item: Dict[str, Any]) -> Dict[str, Any]:
     silently: the run reports success, leads store fine, and the damage only
     surfaces as outreach addressed to "<name> at None".
 
-    `currentPosition` may be a list or a single dict depending on build, so
-    both are handled; `experience[0]` is the fallback.
+    The key name is not stable across actors OR across modes of the SAME
+    actor — confirmed by inspection of real payloads:
+
+        profile-search, Full mode      -> currentPosition  (singular)
+        company-employees, Short mode  -> currentPositions (PLURAL)
+
+    Missing the plural cost a whole Bridge run: all 100 candidates mapped with
+    company=None, and `import_bridge_candidates` drops any candidate without a
+    company because the column is NOT NULL and is half the dedup identity. The
+    run fetched and billed 100 profiles and stored zero, reporting success.
+
+    Every spelling is therefore tried, and `experience[0]` remains the last
+    resort.
     """
-    for key in ("currentPosition", "experience"):
+    for key in ("currentPosition", "currentPositions", "positions", "experience"):
         value = item.get(key)
         if isinstance(value, list) and value:
             value = value[0]
