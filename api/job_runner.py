@@ -71,6 +71,17 @@ def import_leads_to_supabase(
                 "title": lead.get("title") or lead.get("job_title"),
                 "location": lead.get("location"),
                 "icp_score": lead.get("icp_score"),
+                # The scorer's HOT/WARM/COLD tier. This was missing entirely:
+                # `icp_tier` was computed, counted for the "Scored: N HOT..."
+                # log line, and then dropped on the floor here — so
+                # scraper_leads.temperature was always NULL.
+                #
+                # The CRM maps it with `tempMap[lead.temperature] ?? 'Cold'`,
+                # and NULL matches nothing, so every lead landed in prospects
+                # as Cold no matter how it scored. Nothing errored; the run
+                # summary even reported the right split, which is why this
+                # looked like a display bug rather than data never being saved.
+                "temperature": lead.get("icp_tier"),
                 "search_combo": lead.get("combo"),
                 "custom1": lead.get("custom1"),
                 "custom2": lead.get("custom2"),
