@@ -16,6 +16,7 @@ from api.bridge_models import (
     BridgeConfirmBatchRequest,
     BridgeRunRequest,
     BridgeSeedListInput,
+    BridgeSeedListUpdate,
 )
 from api.config_generator import get_sender_profile, list_markets, list_organization_markets
 from api.database import get_supabase
@@ -280,6 +281,43 @@ def _bridge_list_seed_lists(organization_id: str) -> Any:
     )
 
 
+def _bridge_fetch_seed_list(seed_list_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_seed_lists")
+        .select("*")
+        .eq("id", seed_list_id)
+        .execute()
+    )
+
+
+def _bridge_update_seed_list(
+    seed_list_id: str, organization_id: str, changes: Dict[str, Any]
+) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_seed_lists")
+        .update(changes)
+        .eq("id", seed_list_id)
+        # Ownership is asserted before we get here, but the org filter stays in
+        # the WHERE clause as well: it makes a cross-tenant write impossible at
+        # the query level, not merely improbable at the handler level.
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+
+def _bridge_delete_seed_list(seed_list_id: str, organization_id: str) -> Any:
+    supabase = get_supabase()
+    return (
+        supabase.table("bridge_seed_lists")
+        .delete()
+        .eq("id", seed_list_id)
+        .eq("organization_id", organization_id)
+        .execute()
+    )
+
+
 def _bridge_fetch_run(run_id: str) -> Any:
     supabase = get_supabase()
     return (
@@ -414,6 +452,67 @@ async def create_bridge_seed_list(seed_list: BridgeSeedListInput) -> Dict[str, A
 async def list_bridge_seed_lists(organization_id: str) -> Dict[str, Any]:
     res = await asyncio.to_thread(_bridge_list_seed_lists, organization_id)
     return {"organization_id": organization_id, "seed_lists": res.data}
+
+
+@app.patch("/bridge/seed-lists/{seed_list_id}")
+async def update_bridge_seed_list(
+    seed_list_id: str, update: BridgeSeedListUpdate
+) -> Dict[str, Any]:
+    """Edit a seed list in place.
+
+    Only fields actually present in the request body are written
+    (`exclude_unset`), so the CRM can send a partial payload without blanking
+    the filters it didn't touch. Sending an explicit empty list still clears
+    that filter — that is a real edit, not an omission.
+    """
+    existing = await asyncio.to_thread(_bridge_fetch_seed_list, seed_list_id)
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Seed list not found")
+
+    _assert_owned_by_org(existing.data[0], update.organization_id, "seed list")
+
+    changes = update.model_dump(exclude_unset=True, exclude_none=True)
+    changes.pop("organization_id", None)  # scope, never a mutable field
+    if not changes:
+        # Nothing to write. Return the row unchanged rather than issuing an
+        # empty UPDATE, which PostgREST rejects.
+        return existing.data[0]
+
+    res = await asyncio.to_thread(
+        _bridge_update_seed_list, seed_list_id, update.organization_id, changes
+    )
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Seed list not found")
+
+    return res.data[0]
+
+
+@app.delete("/bridge/seed-lists/{seed_list_id}")
+async def delete_bridge_seed_list(
+    seed_list_id: str, organization_id: str
+) -> Dict[str, Any]:
+    """Delete a seed list.
+
+    The CRM has had a delete button for this since Bridge shipped, calling a
+    route that did not exist — the proxy forwarded it and the backend answered
+    405. Confirmed by inspection on 30/07/2026: only POST and GET were
+    implemented.
+
+    Historical `bridge_runs` rows keep pointing at the deleted seed_list_id.
+    That is deliberate and matches how the CRM already behaves — it falls back
+    to a generic "Seed list" label rather than erroring — because deleting a
+    list should not erase the record that a run happened.
+    """
+    existing = await asyncio.to_thread(_bridge_fetch_seed_list, seed_list_id)
+    if not existing.data:
+        # Idempotent: a second delete of the same id is not an error, so a
+        # double-click or a retry can't surface a spurious failure.
+        return {"deleted": False, "id": seed_list_id, "reason": "not found"}
+
+    _assert_owned_by_org(existing.data[0], organization_id, "seed list")
+
+    await asyncio.to_thread(_bridge_delete_seed_list, seed_list_id, organization_id)
+    return {"deleted": True, "id": seed_list_id}
 
 
 @app.post("/bridge/runs")

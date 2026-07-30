@@ -46,6 +46,28 @@ class BridgeRunRequest(BaseModel):
     apify_token: str
 
 
+class BridgeSeedListUpdate(BaseModel):
+    """Edit a saved seed list in place.
+
+    Every filter field is optional so the CRM can send only what changed; a
+    field left unset is not written, which is what distinguishes "leave this
+    alone" from "clear this list". That distinction matters here because the
+    filters ARE lists — with a non-optional model, editing only the name would
+    silently blank out company_names, industry_codes and the rest.
+
+    `name` and `channel_family` are optional for the same reason. Passing an
+    explicit empty list to clear a filter still works and is intentional.
+    """
+
+    organization_id: str
+    name: Optional[str] = None
+    channel_family: Optional[ChannelFamily] = None
+    company_names: Optional[List[str]] = None
+    industry_codes: Optional[List[int]] = None
+    company_headcounts: Optional[List[str]] = None
+    geo_codes: Optional[List[int]] = None
+
+
 class BridgeCandidateUpdate(BaseModel):
     """Confirm / reject / restore a candidate after human review."""
 
