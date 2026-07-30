@@ -1226,11 +1226,16 @@ def run_bridge_scraping(
             company_headcounts,
             market_names,
             title_keywords,
-            # The incumbent multiplies `limit` per company because it searches
-            # one chunk at a time; here every company goes in one call, so the
-            # cap has to cover the whole request or it returns one company's
-            # worth of people for the entire seed list.
-            limit * max(len(company_names or []), 1),
+            # Two different meanings, matching the incumbent exactly:
+            #  · with companies, `limit` is PER COMPANY (default 3), and the
+            #    incumbent multiplies it by the size of each chunk. Here every
+            #    company goes in one call, so it multiplies by all of them —
+            #    otherwise one seed list of 50 companies would come back with
+            #    a single company's worth of people.
+            #  · filter-only has no per-company anchor to scale from, so the
+            #    incumbent caps it at BRIDGE_FILTER_ONLY_LIMIT (one page, 100).
+            #    Falling through to `limit * 1` here would ask for 3.
+            (limit * len(company_names) if company_names else BRIDGE_FILTER_ONLY_LIMIT),
             emit,
         )
 
@@ -1313,6 +1318,52 @@ def _run_bridge_scraping_harvest(
     it on rejection; here `industryIds` is a declared field with a published
     code list, so it is sent plainly.
     """
+    companies = [
+        _harvest_company_ref(n) for n in (company_names or []) if (n or "").strip()
+    ]
+
+    # Bridge supports a filter-only seed list (criteria, no company names). The
+    # company-employees actor exists to enumerate the staff of given companies:
+    # its input schema happens to declare nothing as required, but an employee
+    # scraper with no employer is undefined behaviour — it may return nothing,
+    # it may error, and the schema does not say which.
+    #
+    # So filter-only searches go to the profile-search actor instead, which is
+    # built for exactly that and is already proven in production here. Same
+    # publisher, same per-profile billing, same seniority/headcount tables, and
+    # `_map_harvest_lead` reads both identically — so the candidates that come
+    # back are indistinguishable downstream.
+    if not companies:
+        emit("[bridge/harvest] no companies on this seed list — using the profile-search actor")
+        search_payload: Dict[str, Any] = {
+            "profileScraperMode": "Short",
+            "maxItems": limit,
+            "startPage": 1,
+            "autoQuerySegmentation": False,
+        }
+        titles_only = _truncate_title_keywords(
+            title_keywords, emit, label="bridge", limit=HARVEST_MAX_TITLES
+        )
+        if titles_only:
+            search_payload["currentJobTitles"] = titles_only
+        locs_only = [m for m in (market_names or []) if m]
+        if locs_only:
+            search_payload["locations"] = locs_only
+        hc_only: List[str] = []
+        for label in _normalize_company_headcounts(company_headcounts):
+            code = HARVEST_HEADCOUNT.get(label)
+            if code:
+                hc_only.append(code)
+        if hc_only:
+            search_payload["companyHeadcount"] = hc_only
+        if industry_codes:
+            search_payload["industryIds"] = [int(c) for c in industry_codes][:50]
+
+        emit(f"[bridge/harvest] filter-only input: {_dump(search_payload)}")
+        return _harvest_candidates(
+            client, search_payload, HARVEST_ACTOR_ID, emit
+        )
+
     payload: Dict[str, Any] = {
         # Short mode returns name, profile URL, headline, location and current
         # position — everything `_map_harvest_lead` reads and everything a
@@ -1320,13 +1371,8 @@ def _run_bridge_scraping_harvest(
         # education/skills that Bridge never surfaces.
         "profileScraperMode": "Short",
         "maxItems": limit,
+        "companies": companies[:HARVEST_BRIDGE_MAX_COMPANIES],
     }
-
-    companies = [
-        _harvest_company_ref(n) for n in (company_names or []) if (n or "").strip()
-    ]
-    if companies:
-        payload["companies"] = companies[:HARVEST_BRIDGE_MAX_COMPANIES]
 
     titles = _truncate_title_keywords(
         title_keywords, emit, label="bridge", limit=HARVEST_BRIDGE_MAX_TITLES
@@ -1354,15 +1400,29 @@ def _run_bridge_scraping_harvest(
         payload["industryIds"] = [int(c) for c in industry_codes][:50]
 
     emit(f"[bridge/harvest] input: {_dump(payload)}")
+    return _harvest_candidates(client, payload, HARVEST_BRIDGE_ACTOR_ID, emit)
 
+
+def _harvest_candidates(
+    client: ApifyClient,
+    payload: Dict[str, Any],
+    actor_id: str,
+    emit: LogFn,
+) -> List[Dict[str, Any]]:
+    """Call a HarvestAPI actor and map its items into Bridge candidates.
+
+    Shared by both Bridge paths so the company-employees and profile-search
+    actors produce byte-identical candidate dicts — a filter-only seed list
+    must not yield a subtly different shape from a company-based one.
+    """
     try:
-        items = _call_actor_harvest(client, payload, actor_id=HARVEST_BRIDGE_ACTOR_ID)
+        items = _call_actor_harvest(client, payload, actor_id=actor_id)
     except Exception as exc:  # noqa: BLE001 - a failed search is not a crash
-        emit(f"[bridge/harvest] actor call failed: {exc!r}")
+        emit(f"[bridge/harvest] actor call failed ({actor_id}): {exc!r}")
         return []
 
     if not items:
-        emit("[bridge/harvest] returned no items")
+        emit(f"[bridge/harvest] {actor_id} returned no items")
         return []
 
     emit(f"[bridge/harvest] first item keys: {sorted(_first_dict(items).keys())}")
