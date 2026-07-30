@@ -438,6 +438,47 @@ def _pick(item: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
     return None
 
 
+def _as_text(value: Any) -> Optional[str]:
+    """Coerce an actor field to a plain string.
+
+    HarvestAPI returns several fields as OBJECTS where the incumbent returned
+    strings — `location` is `{"linkedinText": "Vienna, Austria", ...}`, not
+    "Vienna, Austria". Storing the dict as-is type-checks fine and survives
+    every code path that only ever passes the value around, then explodes at
+    the first one that treats it as text:
+
+        _detect_market_from_location -> location.lower()
+        AttributeError: 'dict' object has no attribute 'lower'
+
+    That crash only fires on MULTI-MARKET runs, because single-market runs
+    never call the detector — so the bug sat latent through three successful
+    production runs and surfaced on a 17-country European run, after its
+    leads had already been fetched and billed.
+
+    Everything mapped out of this actor therefore goes through here.
+    """
+    if value is None or isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        for key in ("linkedinText", "text", "name", "label", "title", "value", "default"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner
+        # Last resort: the first plain string in the object, so an unexpected
+        # field name degrades to slightly-wrong text rather than a crash.
+        for inner in value.values():
+            if isinstance(inner, str) and inner.strip():
+                return inner
+        return None
+    if isinstance(value, list):
+        for entry in value:
+            text = _as_text(entry)
+            if text:
+                return text
+        return None
+    return str(value)
+
+
 def _first_position(item: Dict[str, Any]) -> Dict[str, Any]:
     """The current role, as a dict, from whichever shape the actor used.
 
@@ -464,13 +505,13 @@ def _first_position(item: Dict[str, Any]) -> Dict[str, Any]:
 def _map_harvest_lead(item: Dict[str, Any]) -> Dict[str, Any]:
     lead: Dict[str, Any] = {}
     for field, candidates in _HARVEST_FIELD_CANDIDATES:
-        lead[field] = _pick(item, candidates)
+        lead[field] = _as_text(_pick(item, candidates))
 
     # `full_name` has no direct counterpart — HarvestAPI splits the name — so
     # rebuild it. Downstream (`cleanScrapedName`, message generation, the CRM's
     # prospects.name) all read full_name, so leaving it None would produce
     # nameless leads that look like a scraper failure rather than a mapping bug.
-    full_name = _pick(item, ("fullName", "full_name", "name"))
+    full_name = _as_text(_pick(item, ("fullName", "full_name", "name")))
     if not full_name:
         parts = [lead.get("first_name"), lead.get("last_name")]
         full_name = " ".join(p for p in parts if p).strip() or None
@@ -481,15 +522,15 @@ def _map_harvest_lead(item: Dict[str, Any]) -> Dict[str, Any]:
     # outreach message is built around, so a None here ships personalised
     # messages that address the prospect at no company at all.
     position = _first_position(item)
-    lead["company"] = _pick(position, ("companyName", "company", "name"))
-    lead["company_id"] = _pick(position, ("companyId", "company_id", "id"))
+    lead["company"] = _as_text(_pick(position, ("companyName", "company", "name")))
+    lead["company_id"] = _as_text(_pick(position, ("companyId", "company_id", "id")))
 
     # `headline` is a free-text tagline ("CIO | Digital Transformation | ...")
     # rather than a job title. Prefer the structured role title when the
     # position carries one, and keep the headline only as the fallback — the
     # ICP scorer matches this against the combo's title keywords, so a
     # marketing tagline scores worse than the actual role.
-    position_title = _pick(position, ("title", "position", "jobTitle"))
+    position_title = _as_text(_pick(position, ("title", "position", "jobTitle")))
     if position_title:
         lead["job_title"] = position_title
 
