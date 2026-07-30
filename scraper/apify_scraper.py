@@ -799,9 +799,20 @@ def _call_actor_harvest(
     )
     missing = {"timeout_secs", "wait_secs", "max_total_charge_usd"} - set(guards)
     if missing:
+        # Report the version actually loaded. requirements.txt pins >=2.5.1 and
+        # is committed, yet this warning persisted across a deploy — which is
+        # either a cached build layer or `inspect.signature` not seeing through
+        # a wrapper. Printing the version settles which, instead of guessing.
+        try:
+            import importlib.metadata as _md
+            installed = _md.version("apify-client")
+        except Exception:  # noqa: BLE001
+            installed = "unknown"
         log.warning(
-            "[harvest] apify-client too old for %s — call runs unguarded; "
-            "pin a newer apify-client to restore the timeout and spend cap",
+            "[harvest] apify-client %s does not accept %s — call runs unguarded "
+            "(no timeout). requirements.txt pins >=2.5.1; if this version is "
+            "already 2.5.1+, the signature check is at fault, not the install.",
+            installed,
             sorted(missing),
         )
     run = actor_client.call(run_input=run_input, logger=None, **guards)
