@@ -4,6 +4,8 @@ import logging
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from apify_client import ApifyClient
@@ -787,6 +789,12 @@ def _call_actor_harvest(
     actor_id: str = HARVEST_ACTOR_ID,
 ) -> List[Any]:
     actor_client = client.actor(actor_id)
+
+    # Pass whatever guards THIS client version understands. The names are not
+    # stable across majors: 2.5.1 accepts timeout_secs/wait_secs/
+    # max_total_charge_usd, while the 3.x deployed on Railway accepts only
+    # max_total_charge_usd — the time controls moved. Introspecting keeps the
+    # spend cap working on both instead of failing with a TypeError on one.
     guards = _supported_call_kwargs(
         actor_client,
         {
@@ -797,25 +805,40 @@ def _call_actor_harvest(
             ),
         },
     )
-    missing = {"timeout_secs", "wait_secs", "max_total_charge_usd"} - set(guards)
-    if missing:
-        # Report the version actually loaded. requirements.txt pins >=2.5.1 and
-        # is committed, yet this warning persisted across a deploy — which is
-        # either a cached build layer or `inspect.signature` not seeing through
-        # a wrapper. Printing the version settles which, instead of guessing.
-        try:
-            import importlib.metadata as _md
-            installed = _md.version("apify-client")
-        except Exception:  # noqa: BLE001
-            installed = "unknown"
-        log.warning(
-            "[harvest] apify-client %s does not accept %s — call runs unguarded "
-            "(no timeout). requirements.txt pins >=2.5.1; if this version is "
-            "already 2.5.1+, the signature check is at fault, not the install.",
-            installed,
-            sorted(missing),
+
+    # The TIME bound is enforced here rather than by the client, because
+    # chasing per-version parameter names is how this ended up unguarded in
+    # production twice: pinned >=2.5.1, deployed 3.1.0, guards silently
+    # dropped. `.call()` blocks until the actor finishes and, unbounded,
+    # honours the ACTOR's own timeout — over eight hours on these actors.
+    #
+    # A worker thread we stop waiting on can't be killed (Python has no such
+    # primitive), so the request may keep running in the background until it
+    # finishes on its own. That is acceptable and still a strict improvement:
+    # the RUN stops being blocked, the combo is reported empty, and the job
+    # moves on — instead of one queued actor pinning the worker for the day.
+    # NOT `with ThreadPoolExecutor(...)`: the context manager exits via
+    # shutdown(wait=True), which blocks on exactly the thread we are trying to
+    # abandon — the timeout would be measured and then thrown away, leaving the
+    # original 8-hour block intact and looking fixed. Shut down explicitly with
+    # wait=False instead.
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(
+            actor_client.call, run_input=run_input, logger=None, **guards
         )
-    run = actor_client.call(run_input=run_input, logger=None, **guards)
+        try:
+            run = future.result(timeout=HARVEST_CALL_TIMEOUT_SECONDS)
+        except FuturesTimeout:
+            log.warning(
+                "[harvest] %s did not return within %ss — abandoning this call "
+                "and treating the combo as empty",
+                actor_id,
+                HARVEST_CALL_TIMEOUT_SECONDS,
+            )
+            return []
+    finally:
+        pool.shutdown(wait=False)
     # On timeout the client returns whatever state the run is in rather than
     # raising, so an unfinished run must be treated as empty instead of having
     # its (absent or partial) dataset read as if it were complete.
