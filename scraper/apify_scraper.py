@@ -88,6 +88,21 @@ HARVEST_MAX_TITLES = 50
 # above are shared rather than duplicated.
 HARVEST_BRIDGE_ACTOR_ID = "harvestapi/linkedin-company-employees"
 
+# The two HarvestAPI actors DISAGREE on the enum for `profileScraperMode`,
+# despite sharing a publisher and the field name:
+#
+#   linkedin-profile-search      accepts "Short" / "Full"
+#   linkedin-company-employees   accepts "Short ($4 per 1k)" /
+#                                        "Full ($8 per 1k)" /
+#                                        "Full + email search ($12 per 1k)"
+#
+# i.e. the second one's VALUES carry the price, not just its UI labels. Sending
+# a bare "Short" there fails the whole input with InvalidRequestError, which is
+# exactly how the first Bridge run against it died. Both are read from each
+# actor's published schema rather than assumed to match — because they don't.
+HARVEST_MODE_SHORT = "Short"                       # profile-search
+HARVEST_BRIDGE_MODE_SHORT = "Short ($4 per 1k)"    # company-employees
+
 # Schema-declared ceilings for the Bridge actor, read from its published input
 # schema rather than guessed:
 HARVEST_BRIDGE_MAX_COMPANIES = 1000   # `companies`
@@ -1336,7 +1351,7 @@ def _run_bridge_scraping_harvest(
     if not companies:
         emit("[bridge/harvest] no companies on this seed list — using the profile-search actor")
         search_payload: Dict[str, Any] = {
-            "profileScraperMode": "Short",
+            "profileScraperMode": HARVEST_MODE_SHORT,
             "maxItems": limit,
             "startPage": 1,
             "autoQuerySegmentation": False,
@@ -1365,11 +1380,11 @@ def _run_bridge_scraping_harvest(
         )
 
     payload: Dict[str, Any] = {
-        # Short mode returns name, profile URL, headline, location and current
+        # Short returns name, profile URL, headline, location and current
         # position — everything `_map_harvest_lead` reads and everything a
-        # partnership contact card shows. Full costs double per profile for
-        # education/skills that Bridge never surfaces.
-        "profileScraperMode": "Short",
+        # partnership card shows. Full costs double per profile for education
+        # and skills that Bridge never surfaces.
+        "profileScraperMode": HARVEST_BRIDGE_MODE_SHORT,
         "maxItems": limit,
         "companies": companies[:HARVEST_BRIDGE_MAX_COMPANIES],
     }
