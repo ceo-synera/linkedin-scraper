@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - defensive against client layout change
 # on the full scored batch remains the authoritative one that determines
 # what's actually stored.
 from api.config_generator import (
+    list_markets,
     MarketNotFoundError,
     MixedRegionMarketsError,
     region_label,
@@ -81,6 +82,38 @@ HARVEST_ACTOR_ID = "harvestapi/linkedin-profile-search"
 # pricing — it bills per profile RETURNED, not per filter sent — so a wider
 # title list is strictly better matching at no extra cost.
 HARVEST_MAX_TITLES = 50
+
+# Bridge's counterpart. Same publisher, same billing model (per profile
+# returned), same seniority/headcount vocabularies — so the two mapping tables
+# above are shared rather than duplicated.
+HARVEST_BRIDGE_ACTOR_ID = "harvestapi/linkedin-company-employees"
+
+# Schema-declared ceilings for the Bridge actor, read from its published input
+# schema rather than guessed:
+HARVEST_BRIDGE_MAX_COMPANIES = 1000   # `companies`
+HARVEST_BRIDGE_MAX_LOCATIONS = 50     # `locations`
+HARVEST_BRIDGE_MAX_TITLES = 50        # `jobTitles`
+
+
+def _harvest_company_ref(name: str) -> str:
+    """Turn a stored company NAME into what the actor wants.
+
+    The actor asks for full LinkedIn company URLs and only falls back to
+    resolving a bare name ("it will try to find the company on LinkedIn"),
+    which is lossier. Seed lists store names, so anything that already looks
+    like a URL is passed through untouched and everything else is sent as the
+    plain name for the actor to resolve.
+
+    Storing real company URLs on the seed list would remove that ambiguity
+    entirely and is worth doing once the Bridge form can capture them — noted
+    rather than faked here, because deriving a slug from a display name
+    ("Acme Corp." -> /company/acme-corp) guesses wrong often enough that a
+    silently-wrong company is worse than an honest name lookup.
+    """
+    candidate = (name or "").strip()
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        return candidate
+    return candidate
 
 
 def _use_harvest() -> bool:
@@ -718,8 +751,12 @@ def _supported_call_kwargs(actor_client: Any, desired: Dict[str, Any]) -> Dict[s
     return {k: v for k, v in desired.items() if k in accepted}
 
 
-def _call_actor_harvest(client: ApifyClient, run_input: Dict[str, Any]) -> List[Any]:
-    actor_client = client.actor(HARVEST_ACTOR_ID)
+def _call_actor_harvest(
+    client: ApifyClient,
+    run_input: Dict[str, Any],
+    actor_id: str = HARVEST_ACTOR_ID,
+) -> List[Any]:
+    actor_client = client.actor(actor_id)
     guards = _supported_call_kwargs(
         actor_client,
         {
@@ -1156,6 +1193,47 @@ def run_bridge_scraping(
     emit: LogFn = log_fn or log.info
     client = ApifyClient(apify_token)
 
+    if _use_harvest():
+        # The signature keeps taking geo_codes because that is what the seed
+        # list stores and what the incumbent needs; HarvestAPI wants country
+        # NAMES, so translate here rather than changing every caller. An
+        # unrecognised code is dropped with a log line instead of being sent
+        # as-is — a numeric string in `locations` matches nothing and would
+        # look like an empty result rather than a bad filter.
+        market_names: List[str] = []
+        if geo_codes:
+            wanted = {int(code) for code in geo_codes}
+            try:
+                by_code = {
+                    int(m["geo_code"]): m["name"]
+                    for m in list_markets()
+                    if m.get("geo_code") is not None
+                }
+            except Exception as exc:  # noqa: BLE001 - fall back to no geo filter
+                emit(f"[bridge/harvest] could not read markets ({exc!r}); no location filter")
+                by_code = {}
+            for code in sorted(wanted):
+                name = by_code.get(code)
+                if name:
+                    market_names.append(name)
+                else:
+                    emit(f"[bridge/harvest] geo_code {code} has no market row; skipped")
+
+        return _run_bridge_scraping_harvest(
+            client,
+            company_names,
+            industry_codes,
+            company_headcounts,
+            market_names,
+            title_keywords,
+            # The incumbent multiplies `limit` per company because it searches
+            # one chunk at a time; here every company goes in one call, so the
+            # cap has to cover the whole request or it returns one company's
+            # worth of people for the entire seed list.
+            limit * max(len(company_names or []), 1),
+            emit,
+        )
+
     title_keywords = _truncate_title_keywords(title_keywords, emit, label="bridge")
 
     # Filters shared by every search, only included when actually set so the
@@ -1209,6 +1287,99 @@ def run_bridge_scraping(
 
         emit(f"[bridge] running total: {len(candidates)} candidate(s)")
 
+    return candidates
+
+
+def _run_bridge_scraping_harvest(
+    client: ApifyClient,
+    company_names: List[str],
+    industry_codes: List[int],
+    company_headcounts: List[str],
+    market_names: List[str],
+    title_keywords: List[str],
+    limit: int,
+    emit: LogFn,
+) -> List[Dict[str, Any]]:
+    """Bridge against harvestapi/linkedin-company-employees.
+
+    Structurally simpler than the incumbent path, for the same reason the
+    search actor was: one synchronous call instead of init/poll, and no
+    company-name batching — the actor accepts up to 1000 companies in a single
+    request, where the incumbent capped out at MAX_COMPANY_NAMES_PER_BATCH (10)
+    and needed one search per chunk.
+
+    `industry_codes` also stops being a gamble. The incumbent never confirmed
+    it accepted the field, so `_init_bridge_search` sent it and retried without
+    it on rejection; here `industryIds` is a declared field with a published
+    code list, so it is sent plainly.
+    """
+    payload: Dict[str, Any] = {
+        # Short mode returns name, profile URL, headline, location and current
+        # position — everything `_map_harvest_lead` reads and everything a
+        # partnership contact card shows. Full costs double per profile for
+        # education/skills that Bridge never surfaces.
+        "profileScraperMode": "Short",
+        "maxItems": limit,
+    }
+
+    companies = [
+        _harvest_company_ref(n) for n in (company_names or []) if (n or "").strip()
+    ]
+    if companies:
+        payload["companies"] = companies[:HARVEST_BRIDGE_MAX_COMPANIES]
+
+    titles = _truncate_title_keywords(
+        title_keywords, emit, label="bridge", limit=HARVEST_BRIDGE_MAX_TITLES
+    )
+    if titles:
+        payload["jobTitles"] = titles
+
+    # Country NAMES, not geo codes — same as the search actor. The caller keeps
+    # passing the org's market names straight through, so no lookup is needed.
+    locations = [m for m in (market_names or []) if m]
+    if locations:
+        payload["locations"] = locations[:HARVEST_BRIDGE_MAX_LOCATIONS]
+
+    headcounts: List[str] = []
+    for label in _normalize_company_headcounts(company_headcounts):
+        code = HARVEST_HEADCOUNT.get(label)
+        if code:
+            headcounts.append(code)
+        else:
+            emit(f"[bridge/harvest] dropped unmapped headcount label: {label!r}")
+    if headcounts:
+        payload["companyHeadcount"] = headcounts
+
+    if industry_codes:
+        payload["industryIds"] = [int(c) for c in industry_codes][:50]
+
+    emit(f"[bridge/harvest] input: {_dump(payload)}")
+
+    try:
+        items = _call_actor_harvest(client, payload, actor_id=HARVEST_BRIDGE_ACTOR_ID)
+    except Exception as exc:  # noqa: BLE001 - a failed search is not a crash
+        emit(f"[bridge/harvest] actor call failed: {exc!r}")
+        return []
+
+    if not items:
+        emit("[bridge/harvest] returned no items")
+        return []
+
+    emit(f"[bridge/harvest] first item keys: {sorted(_first_dict(items).keys())}")
+
+    candidates: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        lead = _map_harvest_lead(item)
+        url = lead.get("linkedin_url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        candidates.append(lead)
+
+    emit(f"[bridge/harvest] {len(candidates)} candidate(s) after dedup")
     return candidates
 
 
