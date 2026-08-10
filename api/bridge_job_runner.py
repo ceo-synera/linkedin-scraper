@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from api.bridge_models import BridgeRunRequest
 from api.database import get_supabase
 from scraper.apify_scraper import BRIDGE_TITLE_KEYWORDS, run_bridge_scraping
+from scraper.bridge_icp_scorer import score_bridge_candidate
 
 log = logging.getLogger("scraper")
 
@@ -81,6 +82,22 @@ def get_bridge_seed_list(
     )
     return res.data[0] if res.data else None
 
+
+
+def _bridge_icp(candidate: Dict[str, Any], company_name: Any) -> Dict[str, Any]:
+    """Only the two columns that get persisted.
+
+    `icp_breakdown` is deliberately dropped: it exists to explain a score while
+    tuning the weights, and bridge_candidates has no column for it. Returning
+    it here would raise PGRST204 on every insert.
+
+    `company_name` is passed in rather than read off the candidate because the
+    runner resolves it separately (a candidate can carry no company of its own
+    while still belonging to a seed-list company) — and that resolved value is
+    exactly what the targeting component is scoring.
+    """
+    scored = score_bridge_candidate({**candidate, "company_name": company_name})
+    return {"icp_score": scored["icp_score"], "icp_tier": scored["icp_tier"]}
 
 def dedup_bridge_candidates(
     candidates: List[Dict[str, Any]], organization_id: str
@@ -185,6 +202,12 @@ def import_bridge_candidates(
                 "linkedin_url": candidate.get("linkedin_url"),
                 "location": candidate.get("location"),
                 "about": candidate.get("about"),
+                # Scored here, at insert, from the fields being written on the
+                # same line — not later in the CRM. Keeping the algorithm in
+                # one language next to the sales scorer is the whole point: a
+                # TypeScript copy would keep using yesterday's thresholds the
+                # first time anyone tunes these, with nothing to flag it.
+                **_bridge_icp(candidate, company_name),
                 "verification_status": "pending",
                 "created_at": now,
                 "updated_at": now,
