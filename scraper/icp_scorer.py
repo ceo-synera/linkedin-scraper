@@ -1,3 +1,62 @@
+"""ICP scoring for scraped sales leads.
+
+⚠️  KNOWN BROKEN — MEASURED 05/08/2026, DELIBERATELY NOT FIXED YET
+==================================================================
+Read this before trusting any icp_score or HOT/WARM/COLD tier in the product.
+The fix was deferred on purpose: correcting it re-scores every existing lead,
+which changes temperatures SDRs already know, so it needs to be a scheduled
+change rather than a drive-by.
+
+1. THREE OF THE FIVE COMPONENTS ARE CONSTANTS (40 of 100 points)
+   `_score_company_size`, `_score_industry` and `_score_linkedin_activity`
+   return a fixed number for every lead. Two are defended in their comments by
+   the actor filtering on those criteria at input; `_score_industry` is openly
+   a placeholder. Whatever the justification, they cannot discriminate between
+   two leads.
+
+2. `ai` IS MATCHED AS A SUBSTRING (20 more points, effectively constant)
+   AI_SIGNAL_KEYWORDS contains the bare string "ai", tested with `in`. It
+   matches av-AI-lable, m-AI-ntain, em-AI-l, det-AI-l, ch-AI-rman, ret-AIl,
+   T-AI-pei — essentially any non-empty English bio scores the full 20. This
+   is not a signal, it is a fourth constant.
+
+3. PRIORITY_TITLES MATCHES SUBSTRINGS TOO, AND FAILS BOTH WAYS (the last 30)
+   False positives — score as C-level:
+       "Director of Marketing", "Sales Director", "Art Director"  -> dire(CTO)r
+       "Recruiting Coordinator", "Social Media Coordinator"       -> (COO)rdinator
+   False negatives — score zero while being exactly the target:
+       "Chief Technology Officer", "Chief Executive Officer",
+       "Chief Information Officer", "VP of Engineering",
+       "Head of Product", "Head of Engineering"
+
+   In other words every Director and every Coordinator in the database has
+   been scored as if they were a CTO, and every C-level title written out in
+   full — which is how many people write it on LinkedIn — scored nothing.
+
+NET EFFECT: 85 of the 100 points measure nothing, and the remaining 30 are
+wrong in both directions. In practice almost every lead with a bio lands on
+60 (WARM), rising to 90 (HOT) only when the title happens to contain "cto" or
+"coo" as a substring.
+
+4. IT IS ALSO NOT MULTI-TENANT, WHICH IS A SEPARATE PROBLEM
+   These lists encode ONE ideal customer profile — technical decision-makers
+   who mention AI. Every organisation using this product sells something
+   different; one selling logistics software wants "Head of Supply Chain" and
+   mentions of "warehouse". The product ALREADY accepts this: `org_combos`
+   lets each org choose which titles to search for. So the scraper searches
+   for the titles the customer chose and then scores the results against a
+   completely different hardcoded profile. The two halves don't talk.
+
+   Fixing (1)–(3) alone yields a scorer that works correctly while measuring
+   the wrong profile for every customer but Insight Software itself.
+
+WHEN FIXING: word-boundary regex instead of `in`, add the spelled-out title
+variants, drop or replace the components that measure nothing, and source the
+target titles from the org's own combos. `bridge_icp_scorer.py` imports
+PRIORITY_TITLES and AI_SIGNAL_KEYWORDS from here precisely so one fix covers
+both pipelines.
+"""
+
 from typing import Any, Dict, List
 
 PRIORITY_TITLES = [
