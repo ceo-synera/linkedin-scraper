@@ -86,21 +86,89 @@ El run escribe **solo** en `scraper_leads`. `prospects` tiene campos que son dom
 
 ## Scoring ICP (`scraper/icp_scorer.py`)
 
-Las keywords están **hardcodeadas** en el módulo. Hubo una versión que las leía por organización desde `org_icp_keywords`, pero se revirtió: esa tabla no existía en Supabase y el loader no toleraba su ausencia, así que todo run fallaba con `PGRST205`. Además, con la tabla vacía todo lead puntuaba ≤30 y salía COLD.
+El scorer **ya no tiene una opinión propia sobre a quién hay que venderle**. Cada
+run construye un `IcpProfile` con `build_icp_profile(combos, company_context)` y
+se lo pasa a `score_leads`: los títulos objetivo salen de los combos del propio
+run y los términos de señal salen del `company_context` de la org. Las dos
+mitades del pipeline por fin coinciden — se busca un set de títulos y se puntúa
+contra ese mismo set.
 
-| Dimensión | Máx | Cómo se calcula |
+| Componente | Máx | De dónde sale |
 |---|---|---|
-| Job title | 30 | `job_title` contra `PRIORITY_TITLES` |
-| Company size | 15 | Fijo — el actor ya filtra por `company_headcounts` |
-| Industry | 10 | Baseline fijo — el actor no devuelve industria |
-| Actividad en LinkedIn | 15 | Fijo — el actor ya filtra por `posted_on_linkedin` |
-| Señal de compra | 20 | Keywords de `AI_SIGNAL_KEYWORDS` en el `about` |
+| Título objetivo | 50 | `title_keywords` de los combos del run, expandidos a sus variantes |
+| Seniority | 20 | El propio título, con vocabulario de jerarquía multilingüe |
+| Señal de compra | 30 | Términos del `company_context` de la org, buscados en el `about` del lead |
 
-Clasificación: **HOT ≥ 70 / WARM 50-69 / COLD < 50**.
+Clasificación: **HOT ≥ 70 / WARM 50-69 / COLD < 50** (compartida con Bridge a
+propósito, para que un candidato de Bridge y un lead de venta signifiquen lo
+mismo cuando dicen HOT).
 
-`icp_tier` se calcula y se loguea (`"Scored: 12 HOT, 20 WARM, 13 COLD"`), pero **no se persiste**: la columna `temperature` de `scraper_leads` no se escribe. La temperatura real es un juicio del SDR después del outreach, no algo que se derive al scrapear.
+**Un componente que la ORG no configuró se excluye del denominador**, no se
+puntúa como cero: una org sin `company_context` sigue teniendo una escala 0-100
+completa en vez de un techo de 70 que nunca puede alcanzar y ninguna forma de
+enterarse. En cambio un campo que le falta al LEAD (un `about` vacío, ~32% de
+ellos) sí puntúa cero — eso es un hecho sobre el lead, no sobre nuestra config.
 
-> Si alguna vez se quiere ICP configurable por organización, la forma correcta es **híbrida**: estos defaults hardcodeados como base, y la tabla por org como *override* opcional. Así una org nueva funciona out-of-the-box y nada se rompe si la tabla no existe.
+`icp_tier` se loguea y se persiste en `scraper_leads.temperature`.
+
+### Qué estaba roto antes (y por qué el número no significaba nada)
+
+Medido el 05/08/2026:
+
+- **Tres de los cinco componentes eran constantes** — 40 de 100 puntos, iguales
+  para todos: `_score_company_size`, `_score_industry` y
+  `_score_linkedin_activity`. No podían distinguir dos leads.
+- **Las keywords se matcheaban como substring.** `"ai"` matcheaba
+  av**ai**lable, em**ai**l, ret**ail** y T**ai**pei, así que esos 20 puntos eran
+  una cuarta constante para cualquiera con bio. `"cto"` matcheaba dire**cto**r y
+  `"coo"` **coo**rdinator, así que **todo Director puntuaba como C-level**,
+  mientras que "Chief Technology Officer" y "VP of Engineering" — escritos
+  completos, como mucha gente los escribe — puntuaban **cero**.
+- **Las listas describían un solo cliente ideal: el nuestro.** `org_combos`
+  existía hacía meses justamente para que cada org eligiera qué títulos buscar,
+  y el scraper buscaba los títulos del cliente para después puntuar contra un
+  perfil que el cliente nunca vio.
+
+Resultado neto: 85 de 100 puntos no medían nada y los otros 15 estaban mal en
+las dos direcciones, así que casi todo lead con bio caía en 60 (WARM) y llegaba
+a 90 (HOT) solo por accidente de substring.
+
+### Matching (`scraper/text_match.py`)
+
+No se arregló con `\b`: `\b` se define sobre caracteres de palabra y estos
+títulos no siempre se escriben en un alfabeto que tenga límites de palabra
+(資訊主管 no los tiene, y ni `\b` ni un split por tokens sirven dentro de
+資深資訊主管). El matcheo es consciente del script:
+
+- una frase con caracteres CJK se busca como **substring** del texto
+  normalizado — correcto, porque el CJK se escribe sin espacios;
+- cualquier otra se busca como **secuencia contigua de tokens completos**, que
+  es exactamente la semántica de límite de palabra y no necesita lookarounds.
+
+La normalización pasa a minúsculas y convierte todo carácter no alfanumérico en
+espacio (`str.isalnum()`, que es True para CJK, latín acentuado y vietnamita),
+así que "Co-Founder" y "co founder" son la misma frase.
+
+Además cada título objetivo se **expande a sus equivalentes** antes de puntuar
+(`expand_title_variants`): el cliente escribe "CTO" y el prospecto escribe
+"Chief Technology Officer", o al revés, o en chino. Eso era la mayor fuente de
+falsos negativos y arreglar el substring solo no lo hubiera resuelto, porque los
+strings son genuinamente distintos.
+
+El orden de los chequeos de seniority también importa, porque los títulos
+senior se escriben prefijando uno más junior: "Vice President" contiene
+"president", 副總裁 contiene 總裁, "Deputy Chief" contiene "chief". El chequeo de
+deputy corre **antes**, y los títulos de asistente ("Executive Assistant to the
+CEO", uno de los más comunes de LinkedIn) se topean en nivel manager.
+
+### Los scores viejos no son comparables, y no se backfillean
+
+Los leads puntuados antes de este cambio conservan su número y ese número
+significa otra cosa. **No se recalculan a propósito**: `scraper_leads` no tiene
+columna `about`, así que el componente de señal de compra no se puede recomputar
+para un lead pasado, y un backfill inventaría una tercera escala en vez de
+recuperar la segunda. Ordená y filtrá dentro de un período, y tratá un 60
+anterior al corte como "desconocido", no como WARM.
 
 ## Bridge (`api/bridge_job_runner.py`)
 
@@ -130,7 +198,15 @@ Los filtros vacíos **se omiten** del input en vez de mandarse como arrays vací
 
 ### Keywords fijas
 
-`BRIDGE_TITLE_KEYWORDS` (17 títulos de partnerships en inglés, español y chino) es fijo y **no configurable por el admin**, a diferencia de los combos de Leads. El admin solo elige en qué empresas/industrias buscar.
+`BRIDGE_TITLE_KEYWORDS` (17 títulos de partnerships en inglés, español y chino) es fijo y **no configurable por el admin**, a diferencia de los combos de Leads. El admin solo elige en qué empresas/industrias buscar. Sigue siendo un hueco de multi-tenancy conocido (ver MULTI_TENANCY.md, punto 4), pero ahora la lista **se le pasa al scorer como parámetro** desde `import_bridge_candidates` en vez de importarse dentro de él: el día que los títulos de partnerships sean por org, cambia ese call site y nada más.
+
+El scoring de Bridge es propio (`scraper/bridge_icp_scorer.py`): 45 por el
+título de partnership, 20 por seniority y 35 por pertenecer a una empresa que el
+admin eligió a mano — esto último es evidencia real de fit y es algo que el
+pipeline de ventas no tiene. Antes importaba `PRIORITY_TITLES` y
+`AI_SIGNAL_KEYWORDS` del scorer de ventas y heredaba sus dos bugs de substring,
+más un 15 fijo por tamaño de empresa que Bridge ni siquiera podía justificar
+(una seed list puede no filtrar headcount).
 
 ### `industry_codes` puede no estar soportado
 
@@ -305,7 +381,7 @@ Railway marca como `error` todo lo que sale por **stderr**. Como el logging defa
 | `org_combos` | `organization_id`, `combo_code`, `is_active` (**no** `enabled`) |
 | `scraper_combos_master` | `code` (**no** `combo_code`), `title_keywords`, `seniority_levels`, `company_headcounts` |
 | `sender_profiles` | `id`, **`organization_id`**, `display_name`, `title`, `company`, `style_hint`, `icp_focus`, `language`, `years_experience`, `seniority`, `expertise_area`, `connection_note_max_chars`, `followup_max_chars` |
-| `scraper_leads` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `first_name`, `last_name`, `company`, `title`, `location`, `icp_score`, `search_combo`, `custom1`, `custom2`, `market`, `exported_to_crm`, `created_at`. **No tiene `email`.** |
+| `scraper_leads` | `organization_id`, `run_id`, `linkedin_url`, `full_name`, `first_name`, `last_name`, `company`, `title`, `location`, `icp_score`, **`temperature`** (el `icp_tier` del scorer), `search_combo`, `custom1`, `custom2`, `market`, `exported_to_crm`, `created_at`. **No tiene `email`.** |
 | `prospects` | Solo se **lee** para dedup (`linkedin_url`). El insert lo hace el CRM. |
 | `monthly_lead_counts` | `organization_id`, **`year_month`** (`"YYYY-MM"`), **`count`** |
 | `markets` | `id`, `name` (UNIQUE), `geo_code`, `region` (`asia`/`latin_america`/`europe`/`usa`), `default_language`, `is_active` |
@@ -369,6 +445,16 @@ web: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 | 2026-07-27 | `POST /bridge/candidates/confirm-batch` nunca se implementó → 405 en "Confirm & Send Messages" (QA-F27) | Endpoint agregado; reutiliza `generate_messages_for_batch`; requiere `assigned_to`/`custom1`/`custom2` en `bridge_candidates` (ver Bridge) |
 | 2026-07-27 | Todos los candidatos de Bridge mostraban "Unknown company" pese a tener el company match correcto (QA-F26) | La tabla guarda el nombre en `company_name`, no `company` (el campo que el CRM siempre leyó) → dato bien persistido, nunca expuesto con ese nombre. `_candidate_public()` agrega el alias `company` en toda respuesta de candidatos |
 | 2026-07-28 | Idioma de mensajes roto en todos los mercados: un `language="en"` explícito de un SDR se ignoraba; un `language` legado no-`"en"` de un SDR le ganaba a cualquier mercado (Canadá/EEUU saliendo en español; Taiwan/HK inconsistente entre SDRs) | `_resolve_language` comparaba contra `DEFAULT_LANGUAGE` en vez de `None`, y `SenderProfile.language` defaulteaba a `"en"` — indistinguible de "nunca configurado". `language: Optional[str] = None` + comparación contra `None`. Requiere que `sender_profiles.language` acepte `NULL` (hoy `NOT NULL DEFAULT 'en'` en el CRM) y limpieza de los perfiles ya corrompidos por el bug |
+
+### Cambios de multi-tenancy (04/09/2026)
+
+| Qué | Antes | Ahora |
+|---|---|---|
+| Definiciones de combo | Catálogo global; `get_combo_definitions` cargaba cualquier código que el FK aceptara | Filtra `organization_id.is.null,organization_id.eq.<org>`. **Es un límite de seguridad real**: `org_combos.combo_code` es solo un FK a `scraper_combos_master(code)`, así que un admin puede togglear el código privado de otro cliente; este backend tiene el service role y RLS no lo frena, el `WHERE` es toda la defensa |
+| Títulos objetivo del ICP | `PRIORITY_TITLES` hardcodeado (nuestro comprador) | Los `title_keywords` de los combos del propio run |
+| Señal de compra | `AI_SIGNAL_KEYWORDS` hardcodeado, matcheado como substring | Términos del `company_context` de la org |
+| Matching | `keyword in text` | `scraper/text_match.py`, por frase y consciente del script |
+| Scoring de Bridge | Importaba las listas del scorer de ventas | Recibe los títulos por parámetro; componentes propios |
 
 ## Verificación
 

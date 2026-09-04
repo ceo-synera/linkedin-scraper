@@ -15,7 +15,7 @@ from api.lead_distributor import distribute_leads
 from api.message_generator import generate_messages_for_batch
 from api.models import RunRequest, SenderProfile
 from scraper.apify_scraper import run_scraping
-from scraper.icp_scorer import score_leads
+from scraper.icp_scorer import build_icp_profile, score_leads
 
 
 async def _log(run_id: str, level: str, message: str) -> None:
@@ -180,8 +180,28 @@ async def run_job(run_request: RunRequest) -> None:
 
         # score_leads / distribute_leads are pure in-memory CPU work (sub-ms for
         # these volumes), so they stay on the loop.
+        #
+        # The profile is what makes the score mean anything: the target titles
+        # are the run's OWN combos and the buying-signal terms are the org's own
+        # company_context, so a run searches for a set of titles and is then
+        # scored against that same set. Both are already loaded above — building
+        # the profile costs no extra query. Logged so an admin reading the run
+        # can see what their leads were measured against, and so an org that
+        # never filled in company_context finds out here rather than by
+        # wondering why nothing is HOT.
+        icp_profile = build_icp_profile(combos, run_request.company_context)
+        await _log(run_id, "info", icp_profile.describe())
+        if not icp_profile.scores_titles:
+            await _log(
+                run_id,
+                "error",
+                "None of this run's combos define title_keywords, so leads are "
+                "being scored on seniority alone. Add job titles to the combo in "
+                "Settings > Scraper.",
+            )
+
         await _log(run_id, "info", "Scoring leads...")
-        scored_leads = score_leads(raw_leads)
+        scored_leads = score_leads(raw_leads, icp_profile)
         scored_hot = sum(1 for lead in scored_leads if lead.get("icp_tier") == "HOT")
         scored_warm = sum(1 for lead in scored_leads if lead.get("icp_tier") == "WARM")
         scored_cold = sum(1 for lead in scored_leads if lead.get("icp_tier") == "COLD")
@@ -320,8 +340,13 @@ async def run_job(run_request: RunRequest) -> None:
         except Exception as exc:
             await _log(run_id, "error", f"Bookkeeping update failed (non-fatal): {exc}")
 
-        # Hot/warm/cold is no longer derived at scrape time — that's an SDR
-        # judgment call made later, once real outreach has happened.
+        # runs.hot_count / warm_count / cold_count are deliberately NOT written:
+        # the per-run tier split is already in the log line above, and those
+        # three columns were a second copy that nothing read. This is not the
+        # same as scraper_leads.temperature, which IS written per lead in
+        # import_leads_to_supabase — an earlier version of this comment was
+        # read as covering both, which is how the missing temperature went
+        # unnoticed.
         await asyncio.to_thread(
             update_run_status, run_id, "completed", total_leads=len(new_leads)
         )

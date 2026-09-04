@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from api.bridge_models import BridgeRunRequest
 from api.database import get_supabase
 from scraper.apify_scraper import BRIDGE_TITLE_KEYWORDS, run_bridge_scraping
-from scraper.bridge_icp_scorer import score_bridge_candidate
+from scraper.bridge_icp_scorer import expand_target_titles, score_bridge_candidate
 
 log = logging.getLogger("scraper")
 
@@ -84,7 +84,9 @@ def get_bridge_seed_list(
 
 
 
-def _bridge_icp(candidate: Dict[str, Any], company_name: Any) -> Dict[str, Any]:
+def _bridge_icp(
+    candidate: Dict[str, Any], company_name: Any, target_titles: List[str]
+) -> Dict[str, Any]:
     """Only the two columns that get persisted.
 
     `icp_breakdown` is deliberately dropped: it exists to explain a score while
@@ -95,8 +97,14 @@ def _bridge_icp(candidate: Dict[str, Any], company_name: Any) -> Dict[str, Any]:
     runner resolves it separately (a candidate can carry no company of its own
     while still belonging to a seed-list company) — and that resolved value is
     exactly what the targeting component is scoring.
+
+    `target_titles` comes in from the caller rather than being imported by the
+    scorer, so the day partnership titles become per-org (MULTI_TENANCY.md item
+    4) only this call site changes.
     """
-    scored = score_bridge_candidate({**candidate, "company_name": company_name})
+    scored = score_bridge_candidate(
+        {**candidate, "company_name": company_name}, target_titles
+    )
     return {"icp_score": scored["icp_score"], "icp_tier": scored["icp_tier"]}
 
 def dedup_bridge_candidates(
@@ -175,6 +183,11 @@ def import_bridge_candidates(
     supabase = get_supabase()
     now = _now()
 
+    # Expanded once for the whole batch — a run scores hundreds of candidates
+    # against the same list, and the expansion ("VP" -> "Vice President", and so
+    # on) is identical every time.
+    target_titles = expand_target_titles(BRIDGE_TITLE_KEYWORDS)
+
     rows = []
     for candidate in candidates:
         company_name = candidate.get("company")
@@ -207,7 +220,7 @@ def import_bridge_candidates(
                 # one language next to the sales scorer is the whole point: a
                 # TypeScript copy would keep using yesterday's thresholds the
                 # first time anyone tunes these, with nothing to flag it.
-                **_bridge_icp(candidate, company_name),
+                **_bridge_icp(candidate, company_name, target_titles),
                 "verification_status": "pending",
                 "created_at": now,
                 "updated_at": now,

@@ -188,8 +188,10 @@ que el admin del CRM no veía — el backend bypassa RLS, la sesión del usuario
 `exported_to_crm`, `created_at`.
 
 - **No tiene `email`** (causaba `PGRST204`).
-- `temperature` existe pero **no se escribe**: `icp_tier` se calcula y loguea,
-  pero la temperatura real la decide un SDR tras el outreach.
+- `temperature` **sí se escribe** desde el fix de persistencia: guarda el
+  `icp_tier` del scorer. Mientras no se escribía, el CRM la leía como `NULL`,
+  su `tempMap[...] ?? 'Cold'` no matcheaba, y todo lead aterrizaba en
+  `prospects` como Cold sin importar cómo hubiera puntuado.
 - `industry`/`company_size` existen pero no se insertan: el actor no los provee.
 
 ### `prospects` — el insert lo hace el CRM
@@ -273,9 +275,6 @@ tiene `organization_id`; el backend autoriza vía el run padre).
   Bloquea mensajes en planes premium si falta.
 - **`industry_codes` en Bridge** — confirmar con un run real si el actor lo
   acepta. Hay fallback, así que no rompe.
-- **Bridge sin UI en el CRM** — `POST /bridge/runs` espera una fila en
-  `bridge_runs` ya creada en `pending`. Hasta que el CRM la cree, hay que
-  insertarla a mano para probar.
 - **Tablas huérfanas** — `org_company_seed_lists`, `org_channel_hooks` y
   `org_icp_keywords` (si llegó a crearse) ya no las lee nadie tras eliminar BD
   Group y revertir el ICP. Se pueden borrar.
@@ -283,5 +282,6 @@ tiene `organization_id`; el backend autoriza vía el run padre).
   profunda con dedup dentro del loop, y (b) los combos cubren un pool lo bastante
   grande. Sales Navigator corta cada búsqueda en ~2.500 resultados, así que hace
   falta variedad de combos/mercados. Postergado hasta producción.
-- **`icp_scorer` industry** — baseline fijo de 10 hasta enriquecer con otra
-  fuente; el actor no devuelve industria.
+- **`icp_scorer` industria** — ya no es un pendiente: el componente de industria
+  (baseline fijo de 10) se eliminó junto con los otros dos constantes. El actor
+  sigue sin devolver industria; la diferencia es que ahora no se finge que sí.

@@ -175,6 +175,22 @@ def list_organization_markets(organization_id: str) -> List[Dict[str, Any]]:
 
 
 def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[Dict[str, Any]]:
+    """The combo definitions this org may actually run.
+
+    Two filters, and both are load-bearing:
+
+    1. `org_combos` — which of the available combos this org has switched on.
+    2. `scraper_combos_master.organization_id` — whether the definition is the
+       shared catalogue (NULL) or private to one customer.
+
+    The second is a real boundary, not a tidiness check. `org_combos.combo_code`
+    is an FK to `scraper_combos_master(code)` and nothing more, so an org admin
+    can POST any code that exists — including one another customer wrote. Their
+    own Settings page would never show it (that query is scoped), but without
+    this filter the run would happily load that customer's title keywords and
+    search LinkedIn with them. This backend holds the service role key, so RLS
+    does not stop it; the WHERE clause is the whole defence.
+    """
     supabase = get_supabase()
 
     org_combos_res = (
@@ -194,6 +210,7 @@ def get_combo_definitions(organization_id: str, combo_codes: List[str]) -> List[
         supabase.table("scraper_combos_master")
         .select("*")
         .in_("code", enabled_combo_codes)
+        .or_(f"organization_id.is.null,organization_id.eq.{organization_id}")
         .execute()
     )
     return combos_res.data
